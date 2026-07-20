@@ -1100,9 +1100,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "EXL3_MATMUL",
+    "EXL3_MATMUL_ID",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1217,9 +1218,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "exl3_matmul(x,trellis,suh,svh)",
+    "exl3_matmul_id(x,trellis,ids,suh,svh)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3345,6 +3347,50 @@ struct ggml_tensor * ggml_exl3_matmul(
     result->src[2] = suh;
     result->src[3] = svh;
     result->src[4] = bias;
+
+    return result;
+}
+
+// ggml_exl3_matmul_id
+
+struct ggml_tensor * ggml_exl3_matmul_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * suh,
+        struct ggml_tensor  * svh,
+        int                   K,
+        int                   codebook) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(K >= 1 && K <= 8);
+    GGML_ASSERT(trellis->ne[0] == 16*K);
+
+    const int64_t k = trellis->ne[2]*16;
+    const int64_t n = trellis->ne[1]*16;
+
+    GGML_ASSERT(x->ne[0] == k);
+    GGML_ASSERT(suh->ne[0] == k && suh->ne[1] == trellis->ne[3]);
+    GGML_ASSERT(svh->ne[0] == n && svh->ne[1] == trellis->ne[3]);
+    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
+    GGML_ASSERT(x->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[0] % x->ne[1] == 0); // x rows are broadcast over the expert slots
+    GGML_ASSERT(ids->ne[1] == x->ne[2]);
+
+    const int64_t ne[4] = { n, ids->ne[0], x->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, K);
+    ggml_set_op_params_i32(result, 1, codebook);
+
+    result->op     = GGML_OP_EXL3_MATMUL_ID;
+    result->src[0] = x;
+    result->src[1] = trellis;
+    result->src[2] = ids;
+    result->src[3] = suh;
+    result->src[4] = svh;
 
     return result;
 }

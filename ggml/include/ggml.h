@@ -591,6 +591,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_EXL3_MATMUL,
+        GGML_OP_EXL3_MATMUL_ID,
 
         GGML_OP_COUNT,
     };
@@ -1452,6 +1453,24 @@ extern "C" {
             struct ggml_tensor  * suh,
             struct ggml_tensor  * svh,
             struct ggml_tensor  * bias,
+            int                   K,
+            int                   codebook);
+
+    // EXL3 quantized matmul with per-token expert ids:
+    // out[:, u, t] = had128((had128(x[:, u % x->ne[1], t] (*) suh[:, e])) @ W_dec[e] (*) svh[:, e]), e = ids[u, t]
+    // x:       F32,  ne = [k, n_expert_used or 1, n_tokens] (broadcast over the expert slots)
+    // trellis: I16,  ne = [16*K, n/16, k/16, n_expert], K = bits per weight (1..8)
+    // ids:     I32,  ne = [n_expert_used, n_tokens]
+    // suh:     F16,  ne = [k, n_expert]
+    // svh:     F16,  ne = [n, n_expert]
+    // result:  F32,  ne = [n, n_expert_used, n_tokens]
+    GGML_API struct ggml_tensor * ggml_exl3_matmul_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
             int                   K,
             int                   codebook);
 

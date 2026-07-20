@@ -1394,13 +1394,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
 
             // MoE expert weight scales (per-expert, shape {n_expert})
-            if (!layer.ffn_gate_exps_s && layer.ffn_gate_exps) {
+            if (!layer.ffn_gate_exps_s && (layer.ffn_gate_exps || layer.exl3_ffn_gate_exps.trellis)) {
                 layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
+            if (!layer.ffn_down_exps_s && (layer.ffn_down_exps || layer.exl3_ffn_down_exps.trellis)) {
                 layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
+            if (!layer.ffn_up_exps_s && (layer.ffn_up_exps || layer.exl3_ffn_up_exps.trellis)) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
@@ -2788,6 +2788,19 @@ bool llama_model_base::create_tensor_exl3(llm_exl3_weight & dst, llama_model_loa
     dst.trellis = create_tensor(ml, tn(tn_, "trellis", bid), {meta->ne[0], meta->ne[1], meta->ne[2]}, 0);
     dst.suh     = create_tensor(ml, tn(tn_, "suh",     bid), {meta->ne[2]*16}, 0);
     dst.svh     = create_tensor(ml, tn(tn_, "svh",     bid), {meta->ne[1]*16}, 0);
+
+    return true;
+}
+
+bool llama_model_base::create_tensor_exl3_exps(llm_exl3_weight & dst, llama_model_loader & ml, llm_tensor tn_, int bid) {
+    const ggml_tensor * meta = ml.get_tensor_meta(tn(tn_, "trellis", bid).str().c_str());
+    if (meta == nullptr) {
+        return false;
+    }
+
+    dst.trellis = create_tensor(ml, tn(tn_, "trellis", bid), {meta->ne[0], meta->ne[1], meta->ne[2], meta->ne[3]}, 0);
+    dst.suh     = create_tensor(ml, tn(tn_, "suh",     bid), {meta->ne[2]*16, meta->ne[3]}, 0);
+    dst.svh     = create_tensor(ml, tn(tn_, "svh",     bid), {meta->ne[1]*16, meta->ne[3]}, 0);
 
     return true;
 }

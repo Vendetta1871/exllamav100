@@ -970,6 +970,20 @@ struct llm_graph_context {
               ggml_tensor     * cur,
               ggml_tensor     * w_s = nullptr) const;
 
+    // mat_mul_id with a native EXL3 quantized expert pack
+    ggml_tensor * build_exl3_mm_id(
+        const llm_exl3_weight & w,
+              ggml_tensor     * cur,
+              ggml_tensor     * ids) const;
+
+    // dispatch to build_exl3_mm_id if the exl3 weight is present, otherwise build_lora_mm_id
+    ggml_tensor * build_mm_exl3_id(
+              ggml_tensor     * w,
+        const llm_exl3_weight * ex,
+              ggml_tensor     * cur,
+              ggml_tensor     * ids,
+              ggml_tensor     * w_s = nullptr) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
@@ -1034,7 +1048,10 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+       const llm_exl3_weight * exl3_up_exps = nullptr,
+       const llm_exl3_weight * exl3_gate_exps = nullptr,
+       const llm_exl3_weight * exl3_down_exps = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1060,7 +1077,10 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+       const llm_exl3_weight * exl3_up_exps = nullptr,
+       const llm_exl3_weight * exl3_gate_exps = nullptr,
+       const llm_exl3_weight * exl3_down_exps = nullptr) const;
 
     //
     // inputs
@@ -1177,7 +1197,8 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+      const llm_exl3_weight * exl3_wo = nullptr) const;
 
     llm_graph_input_attn_cross * build_attn_inp_cross() const;
 

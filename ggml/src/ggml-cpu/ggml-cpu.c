@@ -2140,6 +2140,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_exl3_matmul(params, tensor);
             } break;
+        case GGML_OP_EXL3_MATMUL_ID:
+            {
+                ggml_compute_forward_exl3_matmul_id(params, tensor);
+            } break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2468,6 +2472,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_EXL3_MATMUL:
+        case GGML_OP_EXL3_MATMUL_ID:
             {
                 n_tasks = n_threads;
             } break;
@@ -2866,6 +2871,11 @@ struct ggml_cplan ggml_graph_plan(
                         // per-thread: acc + xh buffers of rows x 128 floats each
                         const int64_t rows = node->src[0]->ne[1]*node->src[0]->ne[2]*node->src[0]->ne[3];
                         cur = n_tasks*rows*128*2*sizeof(float);
+                    } break;
+                case GGML_OP_EXL3_MATMUL_ID:
+                    {
+                        // per-thread: acc + xh buffers of 128 floats each
+                        cur = n_tasks*128*2*sizeof(float);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {

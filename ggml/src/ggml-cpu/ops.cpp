@@ -12160,3 +12160,96 @@ void ggml_compute_forward_exl3_matmul(const struct ggml_compute_params * params,
         }
     }
 }
+
+// ggml_compute_forward_exl3_matmul_id
+
+void ggml_compute_forward_exl3_matmul_id(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0]; // x, F32 [k, n_expert_used, n_tokens]
+    const struct ggml_tensor * src1 = dst->src[1]; // trellis, I16 [16*K, n/16, k/16, n_expert]
+    const struct ggml_tensor * src2 = dst->src[2]; // ids, I32 [n_expert_used, n_tokens]
+    const struct ggml_tensor * src3 = dst->src[3]; // suh, F16 [k, n_expert]
+    const struct ggml_tensor * src4 = dst->src[4]; // svh, F16 [n, n_expert]
+
+    const int K  = dst->op_params[0];
+    const int cb = dst->op_params[1];
+
+    const int64_t k = src1->ne[2]*16;
+    const int64_t n = src1->ne[1]*16;
+
+    const int64_t n_expert_used = src2->ne[0];
+    const int64_t n_tokens      = src2->ne[1];
+    const int64_t rows = n_expert_used*n_tokens;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
+
+    // per-thread scratch: acc + xh, 128 floats each
+    float * xh  = (float *) params->wdata + (size_t) ith*2*128;
+    float * acc = xh + 128;
+
+    // split the n/128 output blocks among threads
+    const int64_t nb128 = n/128;
+    const int64_t b0 = (nb128*ith)/nth;
+    const int64_t b1 = (nb128*(ith + 1))/nth;
+
+    const int64_t nb = src1->ne[1]; // n-tiles per k-row
+    const size_t tile_size = 16*(size_t) K*sizeof(int16_t);
+
+    for (int64_t blk = b0; blk < b1; ++blk) {
+        for (int64_t r = 0; r < rows; ++r) {
+            const int64_t u = r % n_expert_used;
+            const int64_t t = r / n_expert_used;
+            const int32_t e = *(const int32_t *) ((const char *) src2->data + u*src2->nb[0] + t*src2->nb[1]);
+            GGML_ASSERT(e >= 0 && e < src1->ne[3]);
+
+            const char * trellis_e = (const char *) src1->data + e*src1->nb[3];
+            const ggml_fp16_t * suh_e = (const ggml_fp16_t *) ((const char *) src3->data + e*src3->nb[1]);
+            const ggml_fp16_t * svh_e = (const ggml_fp16_t *) ((const char *) src4->data + e*src4->nb[1]);
+
+            memset(acc, 0, 128*sizeof(float));
+
+            for (int64_t kb = 0; kb < k/128; ++kb) {
+                // xh[*] = had128(x[:,u,t] (*) suh_e[kb*128..])
+                const float * xr = (const float *) ((const char *) src0->data + (u % src0->ne[1])*src0->nb[1] + t*src0->nb[2]) + kb*128;
+                const ggml_fp16_t * suhb = suh_e + kb*128;
+                for (int i = 0; i < 128; ++i) {
+                    xh[i] = xr[i]*ggml_fp16_to_fp32(suhb[i]);
+                }
+                exl3_had128(xh);
+
+                for (int kt = 0; kt < 8; ++kt) {
+                    const int64_t krow = kb*8 + kt;
+                    for (int tn = 0; tn < 8; ++tn) {
+                        // decode tile (krow, blk*8 + tn) of expert e to row-major w[16][16]
+                        const uint32_t * words = (const uint32_t *) (trellis_e + (krow*nb + blk*8 + tn)*tile_size);
+                        float w[256];
+                        for (int i = 0; i < 256; ++i) {
+                            w[exl3_perm(i)] = exl3_decode_cb(exl3_window(words, i, K), cb);
+                        }
+                        const float * xhb = xh + kt*16;
+                        float * accr = acc + tn*16;
+                        for (int jj = 0; jj < 16; ++jj) {
+                            float sum = 0.0f;
+                            for (int ii = 0; ii < 16; ++ii) {
+                                sum += xhb[ii]*w[ii*16 + jj];
+                            }
+                            accr[jj] += sum;
+                        }
+                    }
+                }
+            }
+
+            // y = had128(acc) (*) svh_e
+            exl3_had128(acc);
+            const ggml_fp16_t * svhb = svh_e + blk*128;
+            float * dr = (float *) ((char *) dst->data + u*dst->nb[1] + t*dst->nb[2]) + blk*128;
+            for (int j = 0; j < 128; ++j) {
+                dr[j] = acc[j]*ggml_fp16_to_fp32(svhb[j]);
+            }
+        }
+    }
+}

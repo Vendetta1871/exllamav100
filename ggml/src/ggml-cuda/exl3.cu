@@ -39,11 +39,15 @@ static __device__ __forceinline__ uint32_t exl3_window(const uint32_t * words, i
 }
 
 // xh = had128(x (*) suh), one block per 128-element block of one row
+// ids != nullptr: row r maps to (u = r % ne1, t = r / ne1) and uses expert e = ids[u, t];
+// the x rows are broadcast over the expert slots (x_ne1 = x->ne[1], may be 1)
 static __global__ void exl3_had_in_kernel(
         const float * __restrict__ x, const half * __restrict__ suh, float * __restrict__ xh,
         const int64_t k,
         const int64_t nb1, const int64_t nb2, const int64_t nb3,
-        const int64_t ne1, const int64_t ne2) {
+        const int64_t ne1, const int64_t ne2,
+        const int32_t * __restrict__ ids, const int64_t ids_s1,
+        const int64_t x_ne1) {
     __shared__ float s[128];
 
     const int tid = threadIdx.x;
@@ -53,8 +57,10 @@ static __global__ void exl3_had_in_kernel(
     const int64_t r2  = (row/ne1) % ne2;
     const int64_t r3  = row/(ne1*ne2);
 
-    const float * xr   = (const float *) ((const char *) x + r1*nb1 + r2*nb2 + r3*nb3) + blockIdx.x*128;
-    const half  * suhb = suh + blockIdx.x*128;
+    const int64_t e = ids ? ids[r1 + r2*ids_s1] : 0;
+
+    const float * xr   = (const float *) ((const char *) x + (r1 % x_ne1)*nb1 + r2*nb2 + r3*nb3) + blockIdx.x*128;
+    const half  * suhb = suh + e*k + blockIdx.x*128;
 
     s[tid] = xr[tid]*__half2float(suhb[tid]);
     __syncthreads();
@@ -73,13 +79,15 @@ static __global__ void exl3_had_in_kernel(
 }
 
 // y = had128(xh @ W_dec) (*) svh [+ bias], one block per 128 output columns, rows looped inside
+// ids != nullptr: row r maps to (u = r % ne1, t = r / ne1) and uses expert e = ids[u, t]
 template <int K, int cb>
 static __global__ void exl3_gemv_kernel(
         const uint32_t * __restrict__ trellis, const float * __restrict__ xh,
         const half * __restrict__ svh, const half * __restrict__ bias, float * __restrict__ dst,
         const int64_t k, const int64_t n, const int64_t rows,
         const int64_t nb1, const int64_t nb2, const int64_t nb3,
-        const int64_t ne1, const int64_t ne2) {
+        const int64_t ne1, const int64_t ne2,
+        const int32_t * __restrict__ ids, const int64_t ids_s1) {
     extern __shared__ uint32_t sh[];
     uint32_t * sh_trellis = sh;                          // 8 warps * 64*K words
     float    * sh_red     = (float *) (sh + 8*64*K);     // 8*128 floats
@@ -102,9 +110,16 @@ static __global__ void exl3_gemv_kernel(
 
         const float * xh_row = xh + row*k;
 
+        int64_t e = 0;
+        if (ids) {
+            e = ids[row%ne1 + (row/ne1)*ids_s1];
+        }
+        const uint32_t * trellis_e = trellis + e*krows*nb*(8*K);
+        const half     * svh_e     = svh + e*n;
+
         for (int64_t krow = warp; krow < krows; krow += 8) {
             // stage the 8 n-adjacent tiles of this k-row (contiguous) into shared
-            const uint32_t * src = trellis + (krow*nb + blockIdx.x*8)*(8*K);
+            const uint32_t * src = trellis_e + (krow*nb + blockIdx.x*8)*(8*K);
             for (int i = lane; i < 64*K; i += 32) {
                 sh_w[i] = __ldcs(src + i);
             }
@@ -170,7 +185,7 @@ static __global__ void exl3_gemv_kernel(
 
         if (col < 128) {
             const int64_t out_col = blockIdx.x*128 + col;
-            float v = sh_had[col]*EXL3_HAD128_SCALE*__half2float(svh[out_col]);
+            float v = sh_had[col]*EXL3_HAD128_SCALE*__half2float(svh_e[out_col]);
             if (bias) {
                 v += __half2float(bias[out_col]);
             }
@@ -192,7 +207,10 @@ static __global__ void exl3_gemm_kernel(
         const half * __restrict__ svh, const half * __restrict__ bias, float * __restrict__ dst,
         const int64_t k, const int64_t n, const int64_t rows,
         const int64_t nb1, const int64_t nb2, const int64_t nb3,
-        const int64_t ne1, const int64_t ne2) {
+        const int64_t ne1, const int64_t ne2,
+        const int32_t * __restrict__ ids, const int64_t ids_s1) {
+    GGML_UNUSED(ids); // dense only, the ID op always takes the gemv path
+    GGML_UNUSED(ids_s1);
     extern __shared__ __align__(32) unsigned char shm[];
     half     * a_sh = (half *) shm;                    // M_TILE*16 halfs, row-major
     half     * b_sh = a_sh + M_TILE*16;                // 8*256 halfs, per-warp col-major tile
@@ -294,7 +312,8 @@ static __global__ void exl3_gemm_kernel(
 
 typedef void (* exl3_gemv_kernel_t)(
         const uint32_t *, const float *, const half *, const half *, float *,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        const int32_t *, int64_t);
 
 #define EXL3_GEMV_ROW(K) { exl3_gemv_kernel<K, 0>, exl3_gemv_kernel<K, 1>, exl3_gemv_kernel<K, 2> }
 
@@ -340,7 +359,8 @@ void ggml_cuda_op_exl3_matmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     exl3_had_in_kernel<<<dim3(k/128, rows), 128, 0, stream>>>(
         (const float *) src0->data, (const half *) src2->data, xh.get(), k,
-        src0->nb[1], src0->nb[2], src0->nb[3], src0->ne[1], src0->ne[2]);
+        src0->nb[1], src0->nb[2], src0->nb[3], src0->ne[1], src0->ne[2],
+        nullptr, 0, src0->ne[1]);
 
     if (rows > 8) {
         const int shmem = EXL3_M_TILE*16*sizeof(half) + 8*256*sizeof(half) + 8*8*K*sizeof(uint32_t) + EXL3_M_TILE*128*sizeof(float);
@@ -349,7 +369,8 @@ void ggml_cuda_op_exl3_matmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (const uint32_t *) src1->data, xh.get(), (const half *) src3->data,
             src4 ? (const half *) src4->data : nullptr, (float *) dst->data,
             k, n, rows,
-            dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2]);
+            dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2],
+            nullptr, 0);
         return;
     }
 
@@ -358,5 +379,47 @@ void ggml_cuda_op_exl3_matmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         (const uint32_t *) src1->data, xh.get(), (const half *) src3->data,
         src4 ? (const half *) src4->data : nullptr, (float *) dst->data,
         k, n, rows,
-        dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2]);
+        dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2],
+        nullptr, 0);
+}
+
+void ggml_cuda_op_exl3_matmul_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0]; // x, F32 [k, n_expert_used, n_tokens]
+    const ggml_tensor * src1 = dst->src[1]; // trellis, I16 [16*K, n/16, k/16, n_expert]
+    const ggml_tensor * src2 = dst->src[2]; // ids, I32 [n_expert_used, n_tokens]
+    const ggml_tensor * src3 = dst->src[3]; // suh, F16 [k, n_expert]
+    const ggml_tensor * src4 = dst->src[4]; // svh, F16 [n, n_expert]
+
+    const int K  = ggml_get_op_params_i32(dst, 0);
+    const int cb = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t k    = src1->ne[2]*16;
+    const int64_t n    = src1->ne[1]*16;
+    const int64_t rows = src2->ne[0]*src2->ne[1]; // output rows: n_expert_used x n_tokens (x rows broadcast)
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(src1) && src2->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(ggml_is_contiguous(src3) && ggml_is_contiguous(src4));
+    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
+    GGML_ASSERT(K >= 1 && K <= 8 && cb >= 0 && cb <= 2);
+
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<float> xh(ctx.pool(), (size_t) rows*k);
+
+    // v1: gemv-style path only (rows looped inside); a wmma GEMM-ID path for large
+    // prefill batches is future work
+    exl3_had_in_kernel<<<dim3(k/128, rows), 128, 0, stream>>>(
+        (const float *) src0->data, (const half *) src3->data, xh.get(), k,
+        src0->nb[1], src0->nb[2], src0->nb[3], src2->ne[0], src2->ne[1],
+        (const int32_t *) src2->data, src2->nb[1]/sizeof(int32_t), src0->ne[1]);
+
+    const int shmem = 8*64*K*sizeof(uint32_t) + (8*128 + 128)*sizeof(float);
+    exl3_gemv_kernels[K][cb]<<<dim3(n/128), 256, shmem, stream>>>(
+        (const uint32_t *) src1->data, xh.get(), (const half *) src4->data,
+        nullptr, (float *) dst->data,
+        k, n, rows,
+        dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2],
+        (const int32_t *) src2->data, src2->nb[1]/sizeof(int32_t));
 }

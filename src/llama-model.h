@@ -468,6 +468,9 @@ struct llama_layer {
     llm_exl3_weight exl3_wqkv;
     llm_exl3_weight exl3_wqkv_gate;
     llm_exl3_weight exl3_ssm_out;
+    llm_exl3_weight exl3_ffn_gate_exps;
+    llm_exl3_weight exl3_ffn_up_exps;
+    llm_exl3_weight exl3_ffn_down_exps;
 
     // altup & laurel
     struct ggml_tensor * per_layer_inp_gate   = nullptr;
@@ -747,6 +750,9 @@ struct llama_model_base : public llama_model {
 
     // helper: load a native EXL3 projection (trellis/suh/svh), returns false if not present
     bool create_tensor_exl3(llm_exl3_weight & dst, llama_model_loader & ml, llm_tensor tn_, int bid);
+
+    // helper: load a native EXL3 expert pack (4D trellis/suh/svh), returns false if not present
+    bool create_tensor_exl3_exps(llm_exl3_weight & dst, llama_model_loader & ml, llm_tensor tn_, int bid);
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;

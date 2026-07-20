@@ -28,7 +28,7 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
+void llama_model_gemma4::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const uint32_t n_embd_per_layer = hparams.n_embd_per_layer;
@@ -41,9 +41,11 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
         throw std::runtime_error("Gemma 4 requires n_embd_head_k_swa == n_embd_head_v_swa");
     }
 
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    if (!create_tensor_exl3(exl3_output, ml, LLM_TENSOR_OUTPUT, -1)) {
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    }
     // if output is NULL, init from the input tok embed
-    if (output == NULL) {
+    if (output == NULL && exl3_output.trellis == nullptr) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
 
@@ -70,10 +72,18 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
         // note: use_alternative_attention (v_proj is optional, if it's not present, use k_proj)
-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head}, 0);
-        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k}, kv_flags);
-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v}, TENSOR_NOT_REQUIRED);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
+        if (!create_tensor_exl3(layer.exl3_wq, ml, LLM_TENSOR_ATTN_Q, i)) {
+            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head}, 0);
+        }
+        if (!create_tensor_exl3(layer.exl3_wk, ml, LLM_TENSOR_ATTN_K, i)) {
+            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k}, kv_flags);
+        }
+        if (!create_tensor_exl3(layer.exl3_wv, ml, LLM_TENSOR_ATTN_V, i)) {
+            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v}, TENSOR_NOT_REQUIRED);
+        }
+        if (!create_tensor_exl3(layer.exl3_wo, ml, LLM_TENSOR_ATTN_OUT, i)) {
+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
+        }
 
         layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
         layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, kv_flags);
@@ -92,9 +102,15 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
 
         // for expert layers, we use normal FFN as shared expert (same as python code)
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd}, 0);
+        if (!create_tensor_exl3(layer.exl3_ffn_gate, ml, LLM_TENSOR_FFN_GATE, i)) {
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
+        }
+        if (!create_tensor_exl3(layer.exl3_ffn_up, ml, LLM_TENSOR_FFN_UP, i)) {
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
+        }
+        if (!create_tensor_exl3(layer.exl3_ffn_down, ml, LLM_TENSOR_FFN_DOWN, i)) {
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd}, 0);
+        }
         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
 
         // MoE router
@@ -113,11 +129,17 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
             layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, TENSOR_NOT_REQUIRED);
 
             if (layer.ffn_gate_up_exps == nullptr) {
-                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
-                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                if (!create_tensor_exl3_exps(layer.exl3_ffn_gate_exps, ml, LLM_TENSOR_FFN_GATE_EXPS, i)) {
+                    layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                }
+                if (!create_tensor_exl3_exps(layer.exl3_ffn_up_exps, ml, LLM_TENSOR_FFN_UP_EXPS, i)) {
+                    layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                }
             }
 
-            layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+            if (!create_tensor_exl3_exps(layer.exl3_ffn_down_exps, ml, LLM_TENSOR_FFN_DOWN_EXPS, i)) {
+                layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+            }
 
             // per-expert scale will be loaded as down_exps_s at the end of the current switch case
         }
@@ -226,7 +248,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         // this is to mirror Gemma4Attention in pytorch code
         ggml_tensor * Qcur;
         {
-            Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+            Qcur = build_mm_exl3(model.layers[il].wq, &model.layers[il].exl3_wq, cur, model.layers[il].wq_s);
             cb(Qcur, "Qcur", il);
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
@@ -241,11 +263,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // self-attention
         if (hparams.has_kv(il)) {
-            ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+            ggml_tensor * Kcur = build_mm_exl3(model.layers[il].wk, &model.layers[il].exl3_wk, cur, model.layers[il].wk_s);
             cb(Kcur, "Kcur", il);
 
-            ggml_tensor * Vcur = model.layers[il].wv
-                                    ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
+            ggml_tensor * Vcur = (model.layers[il].wv || model.layers[il].exl3_wv.trellis)
+                                    ? build_mm_exl3(model.layers[il].wv, &model.layers[il].exl3_wv, cur, model.layers[il].wv_s)
                                     : Kcur; // if v_proj is not present, use Kcur as Vcur
             cb(Vcur, "Vcur", il);
 
@@ -265,12 +287,13 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cur = build_attn(inp_attn, model.layers[il].wo,
                     nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
-                    hparams.f_attention_scale, il);
+                    hparams.f_attention_scale, il, &model.layers[il].exl3_wo);
         } else {
             // reuse KV cache of earlier layers
             cur = build_attn(inp_attn,
                     model.layers[il].wo, nullptr, model.layers[il].wo_s,
-                    Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+                    Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il,
+                    &model.layers[il].exl3_wo);
         }
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
@@ -301,7 +324,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
                     nullptr,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+                    LLM_FFN_GELU, LLM_FFN_PAR, il,
+                    &model.layers[il].exl3_ffn_up, &model.layers[il].exl3_ffn_gate, &model.layers[il].exl3_ffn_down);
             cur_mlp = build_norm(cur_mlp,
                     model.layers[il].ffn_post_norm_1, nullptr,
                     LLM_NORM_RMS, il);
@@ -334,7 +358,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_gate_up_exps,
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    model.layers[il].ffn_down_exps_s,
+                    nullptr, // selected_experts_in
+                    &model.layers[il].exl3_ffn_up_exps,
+                    &model.layers[il].exl3_ffn_gate_exps,
+                    &model.layers[il].exl3_ffn_down_exps);
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
                     LLM_NORM_RMS, il);
@@ -353,7 +381,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
                     nullptr,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+                    LLM_FFN_GELU, LLM_FFN_PAR, il,
+                    &model.layers[il].exl3_ffn_up, &model.layers[il].exl3_ffn_gate, &model.layers[il].exl3_ffn_down);
             cb(cur, "ffn_out", il);
         }
         cur = build_norm(cur,
@@ -421,7 +450,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_mm_exl3(model.output, &model.exl3_output, cur, model.output_s);
 
     if (hparams.f_final_logit_softcapping) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);

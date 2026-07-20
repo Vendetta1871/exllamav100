@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -198,7 +199,27 @@ class Exl3Reconstruct:
 
     EXL3_SUBTENSORS = ("trellis", "suh", "svh", "su", "sv", "mcg", "mul1", "bias")
 
+    # per-expert projections that are merged into a single stacked tensor in native mode
+    EXPERT_RE = re.compile(r"\.layers\.(\d+)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)$")
+    EXPERT_PROJ_TENSORS = {
+        "gate_proj": gguf.MODEL_TENSOR.FFN_GATE_EXP,
+        "up_proj":   gguf.MODEL_TENSOR.FFN_UP_EXP,
+        "down_proj": gguf.MODEL_TENSOR.FFN_DOWN_EXP,
+    }
+
     native = False
+
+    @classmethod
+    def filter_tensors(cls, item):
+        # keep exl3 subtensor names intact (arch filters may otherwise append ".weight"
+        # to unknown per-expert names, breaking the subtensor grouping)
+        name, gen = item
+        if "language_model." in name:
+            name = name.replace("language_model.", "")
+        base, dot, sub = name.rpartition(".")
+        if dot and sub in cls.EXL3_SUBTENSORS:
+            return name, gen
+        return super().filter_tensors((name, gen))
 
     def dequant_model(self):
         # exl3 tensors are handled by this mixin, nothing to dequant here
@@ -245,6 +266,15 @@ class Exl3Reconstruct:
 
         self._exl3_codebook = None
         groups, _ = self._split_exl3()
+
+        # per-expert groups are stacked and written after the dense ones
+        expert_groups: dict[tuple[int, str], dict[int, dict]] = {}
+        for base in list(groups.keys()):
+            m = self.EXPERT_RE.search(base)
+            if m and "trellis" in groups[base]:
+                bid, e, proj = int(m.group(1)), int(m.group(2)), m.group(3)
+                expert_groups.setdefault((bid, proj), {})[e] = groups.pop(base)
+
         for base, gens in sorted(groups.items()):
             if "trellis" not in gens:
                 for sub, gen in gens.items():
@@ -254,18 +284,14 @@ class Exl3Reconstruct:
                 continue
 
             parts = {sub: gen() for sub, gen in gens.items()}
-            cb = CB_MUL1 if "mul1" in parts else CB_MCG if "mcg" in parts else CB_3INST
-            if self._exl3_codebook is None:
-                self._exl3_codebook = cb
-            elif self._exl3_codebook != cb:
-                raise ValueError(f"mixed exl3 codebooks are not supported ({base})")
+            self._check_codebook(parts, base)
 
             parts = reorder_exl3_v_heads(parts, base, self.hparams)
 
             prefix = self.map_tensor_name(base + ".weight").removesuffix(".weight")
             trellis = parts["trellis"]
             K = trellis.shape[-1] // 16
-            logger.info(f"writing exl3 layer {base} (K = {K}, cb = {cb})")
+            logger.info(f"writing exl3 layer {base} (K = {K}, cb = {self._exl3_codebook})")
             self.gguf_writer.add_tensor(prefix + ".trellis", trellis.numpy(),
                                         raw_dtype=gguf.GGMLQuantizationType.I16)
             suh = parts["suh"].to(torch.float16) if "suh" in parts else unpack_signs(parts["su"]).to(torch.float16)
@@ -275,8 +301,39 @@ class Exl3Reconstruct:
             if "bias" in parts:
                 self.gguf_writer.add_tensor(prefix + ".bias", parts["bias"].to(torch.float16).numpy())
 
+        for (bid, proj), per_expert in sorted(expert_groups.items()):
+            parts_list = []
+            for e in sorted(per_expert):
+                parts = {sub: gen() for sub, gen in per_expert[e].items()}
+                self._check_codebook(parts, f"layers.{bid}.experts.{e}.{proj}")
+                parts_list.append(parts)
+
+            ks = {p["trellis"].shape[-1] for p in parts_list}
+            if len(ks) != 1:
+                raise ValueError(f"mixed exl3 K across experts (layer {bid}, {proj})")
+            K = ks.pop() // 16
+
+            prefix = self.format_tensor_name(self.EXPERT_PROJ_TENSORS[proj], bid).removesuffix(".weight")
+            logger.info(f"writing exl3 expert pack {prefix} ({len(parts_list)} experts, K = {K})")
+            trellis = np.stack([p["trellis"].numpy() for p in parts_list])
+            self.gguf_writer.add_tensor(prefix + ".trellis", trellis,
+                                        raw_dtype=gguf.GGMLQuantizationType.I16)
+            suh = torch.stack([p["suh"].to(torch.float16) if "suh" in p else unpack_signs(p["su"]).to(torch.float16)
+                               for p in parts_list])
+            svh = torch.stack([p["svh"].to(torch.float16) if "svh" in p else unpack_signs(p["sv"]).to(torch.float16)
+                               for p in parts_list])
+            self.gguf_writer.add_tensor(prefix + ".suh", suh.numpy())
+            self.gguf_writer.add_tensor(prefix + ".svh", svh.numpy())
+
         if self._exl3_codebook is None:
             raise ValueError("no exl3 tensors found in the model")
+
+    def _check_codebook(self, parts: dict[str, torch.Tensor], base: str) -> None:
+        cb = CB_MUL1 if "mul1" in parts else CB_MCG if "mcg" in parts else CB_3INST
+        if self._exl3_codebook is None:
+            self._exl3_codebook = cb
+        elif self._exl3_codebook != cb:
+            raise ValueError(f"mixed exl3 codebooks are not supported ({base})")
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()

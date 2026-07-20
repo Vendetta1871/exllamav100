@@ -2204,6 +2204,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_EXL3_MATMUL:
             ggml_cuda_op_exl3_matmul(ctx, dst);
             break;
+        case GGML_OP_EXL3_MATMUL_ID:
+            ggml_cuda_op_exl3_matmul_id(ctx, dst);
+            break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
@@ -5129,6 +5132,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_EXL3_MATMUL:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I16 &&
                 op->src[2]->type == GGML_TYPE_F16 && op->src[3]->type == GGML_TYPE_F16;
+        case GGML_OP_EXL3_MATMUL_ID:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I16 &&
+                op->src[2]->type == GGML_TYPE_I32 &&
+                op->src[3]->type == GGML_TYPE_F16 && op->src[4]->type == GGML_TYPE_F16;
 
         default:
             return false;
