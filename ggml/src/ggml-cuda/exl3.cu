@@ -1,5 +1,8 @@
 #include "exl3.cuh"
 #include <cstdint>
+#include <mma.h>
+
+namespace wmma = nvcuda::wmma;
 
 #define EXL3_HAD128_SCALE (1.0f/11.313708498984761f) // 1/sqrt(128)
 
@@ -181,6 +184,114 @@ static __global__ void exl3_gemv_kernel(
     }
 }
 
+// y = had128(xh @ W_dec) (*) svh [+ bias] for M_TILE rows per block, Volta tensor cores
+// block: M_TILE rows x 128 output columns (8 n-tiles); warp w handles n-tile w
+template <int K, int cb, int M_TILE>
+static __global__ void exl3_gemm_kernel(
+        const uint32_t * __restrict__ trellis, const float * __restrict__ xh,
+        const half * __restrict__ svh, const half * __restrict__ bias, float * __restrict__ dst,
+        const int64_t k, const int64_t n, const int64_t rows,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int64_t ne1, const int64_t ne2) {
+    extern __shared__ __align__(32) unsigned char shm[];
+    half     * a_sh = (half *) shm;                    // M_TILE*16 halfs, row-major
+    half     * b_sh = a_sh + M_TILE*16;                // 8*256 halfs, per-warp col-major tile
+    uint32_t * pack = (uint32_t *) (b_sh + 8*256);     // 8*8*K words, per-warp packed tile
+    float    * y_sh = (float *) (pack + 8*8*K);        // M_TILE*128 floats, row-major
+
+    const int warp = threadIdx.x/32;
+    const int lane = threadIdx.x%32;
+    const int tid  = threadIdx.x;
+
+    const int64_t nb    = n/16; // n-tiles per k-row
+    const int64_t krows = k/16;
+    const int64_t row0  = blockIdx.y*M_TILE;
+
+    uint32_t * pack_w = pack + warp*8*K;
+    half     * b_w    = b_sh + warp*256;
+
+    // tile position of packed weight i = lane*8 + j: r = r0 + {0,1,8,9}[j%4], c = c0 + (j >= 4 ? 8 : 0)
+    const int c0 = lane/4;
+    const int r0 = (lane%4)*2;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[M_TILE/16];
+#pragma unroll
+    for (int mf = 0; mf < M_TILE/16; ++mf) {
+        wmma::fill_fragment(acc[mf], 0.0f);
+    }
+
+    for (int64_t kt = 0; kt < krows; ++kt) {
+        // stage the A tile (M_TILE x 16) from the F32 xh workspace as fp16, zero-pad edge rows
+#pragma unroll
+        for (int idx = tid; idx < M_TILE*16; idx += 256) {
+            const int64_t r = row0 + idx/16;
+            a_sh[idx] = r < rows ? __float2half(xh[r*k + kt*16 + idx%16]) : __float2half(0.0f);
+        }
+
+        // stage and decode this warp's 16x16 B tile
+        const uint32_t * src = trellis + (kt*nb + blockIdx.x*8 + warp)*(8*K);
+#pragma unroll
+        for (int i = lane; i < 8*K; i += 32) {
+            pack_w[i] = __ldcs(src + i);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float w = exl3_decode_cb<cb>(exl3_window<K>(pack_w, lane*8 + j));
+            b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+        wmma::load_matrix_sync(b_frag, b_w, 16);
+#pragma unroll
+        for (int mf = 0; mf < M_TILE/16; ++mf) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+            wmma::load_matrix_sync(a_frag, a_sh + mf*16*16, 16);
+            wmma::mma_sync(acc[mf], a_frag, b_frag, acc[mf]);
+        }
+        __syncthreads();
+    }
+
+    // store C fragments to the shared y tile (M_TILE x 128)
+#pragma unroll
+    for (int mf = 0; mf < M_TILE/16; ++mf) {
+        wmma::store_matrix_sync(y_sh + mf*16*128 + warp*16, acc[mf], 128, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    // output hadamard + svh + bias per row; each warp handles rows warp, warp+8, ...
+    const int64_t nrows_blk = min((int64_t) M_TILE, rows - row0);
+    for (int64_t r = warp; r < nrows_blk; r += 8) {
+        float * yr = y_sh + r*128;
+        for (int h = 1; h < 128; h *= 2) {
+            for (int p = lane; p < 64; p += 32) {
+                const int i = (p/h)*2*h + p%h;
+                const float a = yr[i];
+                const float b = yr[i + h];
+                yr[i]     = a + b;
+                yr[i + h] = a - b;
+            }
+            __syncwarp();
+        }
+
+        const int64_t row = row0 + r;
+        const int64_t r1 = row % ne1;
+        const int64_t r2 = (row/ne1) % ne2;
+        const int64_t r3 = row/(ne1*ne2);
+        float * dr = (float *) ((char *) dst + r1*nb1 + r2*nb2 + r3*nb3) + blockIdx.x*128;
+        for (int col = lane; col < 128; col += 32) {
+            const int64_t out_col = blockIdx.x*128 + col;
+            float v = yr[col]*EXL3_HAD128_SCALE*__half2float(svh[out_col]);
+            if (bias) {
+                v += __half2float(bias[out_col]);
+            }
+            dr[col] = v;
+        }
+        __syncwarp();
+    }
+}
+
 typedef void (* exl3_gemv_kernel_t)(
         const uint32_t *, const float *, const half *, const half *, float *,
         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
@@ -191,6 +302,16 @@ static const exl3_gemv_kernel_t exl3_gemv_kernels[9][3] = {
     { nullptr, nullptr, nullptr },
     EXL3_GEMV_ROW(1), EXL3_GEMV_ROW(2), EXL3_GEMV_ROW(3), EXL3_GEMV_ROW(4),
     EXL3_GEMV_ROW(5), EXL3_GEMV_ROW(6), EXL3_GEMV_ROW(7), EXL3_GEMV_ROW(8),
+};
+
+#define EXL3_M_TILE 16
+
+#define EXL3_GEMM_ROW(K) { exl3_gemm_kernel<K, 0, EXL3_M_TILE>, exl3_gemm_kernel<K, 1, EXL3_M_TILE>, exl3_gemm_kernel<K, 2, EXL3_M_TILE> }
+
+static const exl3_gemv_kernel_t exl3_gemm_kernels[9][3] = {
+    { nullptr, nullptr, nullptr },
+    EXL3_GEMM_ROW(1), EXL3_GEMM_ROW(2), EXL3_GEMM_ROW(3), EXL3_GEMM_ROW(4),
+    EXL3_GEMM_ROW(5), EXL3_GEMM_ROW(6), EXL3_GEMM_ROW(7), EXL3_GEMM_ROW(8),
 };
 
 void ggml_cuda_op_exl3_matmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -220,6 +341,17 @@ void ggml_cuda_op_exl3_matmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     exl3_had_in_kernel<<<dim3(k/128, rows), 128, 0, stream>>>(
         (const float *) src0->data, (const half *) src2->data, xh.get(), k,
         src0->nb[1], src0->nb[2], src0->nb[3], src0->ne[1], src0->ne[2]);
+
+    if (rows > 8) {
+        const int shmem = EXL3_M_TILE*16*sizeof(half) + 8*256*sizeof(half) + 8*8*K*sizeof(uint32_t) + EXL3_M_TILE*128*sizeof(float);
+        const int m_tiles = (rows + EXL3_M_TILE - 1)/EXL3_M_TILE;
+        exl3_gemm_kernels[K][cb]<<<dim3(n/128, m_tiles), 256, shmem, stream>>>(
+            (const uint32_t *) src1->data, xh.get(), (const half *) src3->data,
+            src4 ? (const half *) src4->data : nullptr, (float *) dst->data,
+            k, n, rows,
+            dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2]);
+        return;
+    }
 
     const int shmem = 8*64*K*sizeof(uint32_t) + (8*128 + 128)*sizeof(float);
     exl3_gemv_kernels[K][cb]<<<dim3(n/128), 256, shmem, stream>>>(
