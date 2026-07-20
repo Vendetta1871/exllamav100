@@ -373,6 +373,8 @@ enum llm_kv {
     LLM_KV_DENSE_2_FEAT_OUT,
     LLM_KV_DENSE_3_FEAT_IN,
     LLM_KV_DENSE_3_FEAT_OUT,
+
+    LLM_KV_EXL3_CODEBOOK,
 };
 
 enum llm_tensor {

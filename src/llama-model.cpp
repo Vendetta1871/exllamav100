@@ -1084,6 +1084,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
+    ml.get_key(LLM_KV_EXL3_CODEBOOK,           hparams.exl3_codebook,   false);
 
     if (arch == LLM_ARCH_HUNYUAN_VL || arch == LLM_ARCH_HUNYUAN_DENSE) {
         if (hparams.n_expert <= 1) {
@@ -2760,6 +2761,14 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
     layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
     if (layer.wqkv) {
         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+    } else if (create_tensor_exl3(layer.exl3_wq, *ml, LLM_TENSOR_ATTN_Q, bid)) {
+        if (!create_tensor_exl3(layer.exl3_wk, *ml, LLM_TENSOR_ATTN_K, bid) ||
+            !create_tensor_exl3(layer.exl3_wv, *ml, LLM_TENSOR_ATTN_V, bid)) {
+            throw std::runtime_error(format("%s: missing exl3 k/v tensors for layer %d", __func__, bid));
+        }
+        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
+        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
+        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
     } else {
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);
@@ -2768,6 +2777,19 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
     }
+}
+
+bool llama_model_base::create_tensor_exl3(llm_exl3_weight & dst, llama_model_loader & ml, llm_tensor tn_, int bid) {
+    const ggml_tensor * meta = ml.get_tensor_meta(tn(tn_, "trellis", bid).str().c_str());
+    if (meta == nullptr) {
+        return false;
+    }
+
+    dst.trellis = create_tensor(ml, tn(tn_, "trellis", bid), {meta->ne[0], meta->ne[1], meta->ne[2]}, 0);
+    dst.suh     = create_tensor(ml, tn(tn_, "suh",     bid), {meta->ne[2]*16}, 0);
+    dst.svh     = create_tensor(ml, tn(tn_, "svh",     bid), {meta->ne[1]*16}, 0);
+
+    return true;
 }
 
 const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {

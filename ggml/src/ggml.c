@@ -1098,9 +1098,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "EXL3_MATMUL",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1215,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "exl3_matmul(x,trellis,suh,svh)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3300,6 +3304,49 @@ void ggml_mul_mat_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 0, prec_i32);
+}
+
+// ggml_exl3_matmul
+
+struct ggml_tensor * ggml_exl3_matmul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * suh,
+        struct ggml_tensor  * svh,
+        struct ggml_tensor  * bias,
+        int                   K,
+        int                   codebook) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16);
+    GGML_ASSERT(K >= 1 && K <= 8);
+    GGML_ASSERT(trellis->ne[0] == 16*K);
+
+    const int64_t k = trellis->ne[2]*16;
+    const int64_t n = trellis->ne[1]*16;
+
+    GGML_ASSERT(x->ne[0] == k);
+    GGML_ASSERT(suh->ne[0] == k);
+    GGML_ASSERT(svh->ne[0] == n);
+    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
+    if (bias != NULL) {
+        GGML_ASSERT(bias->ne[0] == n);
+    }
+
+    const int64_t ne[4] = { n, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, K);
+    ggml_set_op_params_i32(result, 1, codebook);
+
+    result->op     = GGML_OP_EXL3_MATMUL;
+    result->src[0] = x;
+    result->src[1] = trellis;
+    result->src[2] = suh;
+    result->src[3] = svh;
+    result->src[4] = bias;
+
+    return result;
 }
 
 void ggml_mul_mat_set_hint(

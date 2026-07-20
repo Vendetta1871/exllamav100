@@ -216,6 +216,9 @@ struct llama_hparams {
     uint32_t dense_3_feat_in  = 0;  // in_features of the 3_Dense
     uint32_t dense_3_feat_out = 0;  // out_features of the 3_Dense
 
+    // native EXL3 quantized models, 0 = not EXL3
+    uint32_t exl3_codebook = 0;
+
     // xIELU
     std::array<float, LLAMA_MAX_LAYERS> xielu_alpha_n;
     std::array<float, LLAMA_MAX_LAYERS> xielu_alpha_p;

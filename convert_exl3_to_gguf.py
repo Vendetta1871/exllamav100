@@ -122,6 +122,43 @@ def unpack_signs(t: torch.Tensor) -> torch.Tensor:
     return (1.0 - 2.0 * bits).flatten().to(torch.float32)
 
 
+def _v_head_perm(total: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> torch.Tensor:
+    # index permutation of _LinearAttentionVReorderBase._reorder_v_heads (conversion/qwen.py)
+    idx = np.arange(total).reshape(num_k_heads, num_v_per_k, head_dim).transpose(1, 0, 2).reshape(-1)
+    return torch.from_numpy(np.ascontiguousarray(idx)).long()
+
+
+def reorder_exl3_v_heads(parts: dict[str, torch.Tensor], base: str, hparams: dict) -> dict[str, torch.Tensor]:
+    # exl3-native equivalent of the linear_attn V-head reorder done for dense weights:
+    # output-side reorders permute the trellis n-tiles and svh, input-side (out_proj)
+    # permutes the k-tiles and suh; 128 output elements == 8 trellis tiles
+    kh, vh = hparams.get("linear_num_key_heads", 0), hparams.get("linear_num_value_heads", 0)
+    if not kh or not vh or kh == vh or "linear_attn." not in base:
+        return parts
+    vpk = vh // kh
+    hd_k, hd_v = hparams["linear_key_head_dim"], hparams["linear_value_head_dim"]
+    trellis = parts["trellis"]
+
+    if base.endswith("linear_attn.in_proj_qkv"):
+        n0 = hd_k * kh * 2  # v partition starts after q and k rows
+        tp = _v_head_perm((vh * hd_v) // 16, kh, vpk, hd_v // 16)
+        ep = _v_head_perm(vh * hd_v, kh, vpk, hd_v)
+        nt0 = n0 // 16
+        parts["trellis"] = torch.cat([trellis[:, :nt0], trellis[:, nt0:][:, tp]], dim=1)
+        parts["svh"] = torch.cat([parts["svh"][:n0], parts["svh"][n0:][ep]])
+    elif base.endswith("linear_attn.in_proj_z"):
+        tp = _v_head_perm((vh * hd_v) // 16, kh, vpk, hd_v // 16)
+        ep = _v_head_perm(vh * hd_v, kh, vpk, hd_v)
+        parts["trellis"] = trellis[:, tp]
+        parts["svh"] = parts["svh"][ep]
+    elif base.endswith("linear_attn.out_proj"):
+        tp = _v_head_perm((vh * hd_v) // 16, kh, vpk, hd_v // 16)
+        ep = _v_head_perm(vh * hd_v, kh, vpk, hd_v)
+        parts["trellis"] = trellis[tp]
+        parts["suh"] = parts["suh"][ep]
+    return parts
+
+
 def hadamard_matrix(n: int = HAD_DIM) -> torch.Tensor:
     # sylvester chain from hadamard_1 (util/hadamard.py), normalized
     h = np.array([[1.0]])
@@ -156,15 +193,18 @@ def reconstruct_weight(parts: dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 class Exl3Reconstruct:
-    # mixin: replaces exl3 tensor groups (trellis/suh/svh/...) with reconstructed dense weights
+    # mixin: in reconstruct mode, replaces exl3 tensor groups (trellis/suh/svh/...) with
+    # reconstructed dense weights; in native mode, writes the raw exl3 tensors instead
 
     EXL3_SUBTENSORS = ("trellis", "suh", "svh", "su", "sv", "mcg", "mul1", "bias")
 
+    native = False
+
     def dequant_model(self):
-        # exl3 tensors are reconstructed in get_tensors, nothing to dequant here
+        # exl3 tensors are handled by this mixin, nothing to dequant here
         pass
 
-    def get_tensors(self):
+    def _split_exl3(self):
         groups: dict[str, dict[str, torch.Tensor]] = {}
         passthrough: list[tuple[str, object]] = []
         for name, gen in self.model_tensors.items():
@@ -173,14 +213,20 @@ class Exl3Reconstruct:
                 groups.setdefault(base, {})[sub] = gen
             else:
                 passthrough.append((name, gen))
+        return groups, passthrough
 
-        exl3_bases = {base for base, parts in groups.items() if "trellis" in parts}
+    def get_tensors(self):
+        groups, passthrough = self._split_exl3()
 
         for name, gen in passthrough:
             yield name, gen()
 
+        if self.native:
+            # raw exl3 tensors are added in prepare_tensors
+            return
+
         for base, gens in sorted(groups.items()):
-            if base not in exl3_bases:
+            if "trellis" not in gens:
                 # stray subtensor without a trellis, pass through untouched
                 for sub, gen in gens.items():
                     yield f"{base}.{sub}", gen()
@@ -192,6 +238,51 @@ class Exl3Reconstruct:
             if "bias" in parts:
                 yield base + ".bias", parts["bias"]
 
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if not self.native:
+            return
+
+        self._exl3_codebook = None
+        groups, _ = self._split_exl3()
+        for base, gens in sorted(groups.items()):
+            if "trellis" not in gens:
+                for sub, gen in gens.items():
+                    # not an exl3 group after all, write via the standard name mapping
+                    name = f"{base}.{sub}"
+                    self.gguf_writer.add_tensor(self.map_tensor_name(name), gen().numpy())
+                continue
+
+            parts = {sub: gen() for sub, gen in gens.items()}
+            cb = CB_MUL1 if "mul1" in parts else CB_MCG if "mcg" in parts else CB_3INST
+            if self._exl3_codebook is None:
+                self._exl3_codebook = cb
+            elif self._exl3_codebook != cb:
+                raise ValueError(f"mixed exl3 codebooks are not supported ({base})")
+
+            parts = reorder_exl3_v_heads(parts, base, self.hparams)
+
+            prefix = self.map_tensor_name(base + ".weight").removesuffix(".weight")
+            trellis = parts["trellis"]
+            K = trellis.shape[-1] // 16
+            logger.info(f"writing exl3 layer {base} (K = {K}, cb = {cb})")
+            self.gguf_writer.add_tensor(prefix + ".trellis", trellis.numpy(),
+                                        raw_dtype=gguf.GGMLQuantizationType.I16)
+            suh = parts["suh"].to(torch.float16) if "suh" in parts else unpack_signs(parts["su"]).to(torch.float16)
+            svh = parts["svh"].to(torch.float16) if "svh" in parts else unpack_signs(parts["sv"]).to(torch.float16)
+            self.gguf_writer.add_tensor(prefix + ".suh", suh.numpy())
+            self.gguf_writer.add_tensor(prefix + ".svh", svh.numpy())
+            if "bias" in parts:
+                self.gguf_writer.add_tensor(prefix + ".bias", parts["bias"].to(torch.float16).numpy())
+
+        if self._exl3_codebook is None:
+            raise ValueError("no exl3 tensors found in the model")
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        if self.native:
+            self.gguf_writer.add_uint32("exl3.codebook", self._exl3_codebook)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -200,8 +291,11 @@ def parse_args() -> argparse.Namespace:
         "model", type=Path,
         help="directory containing the EXL3 safetensors model")
     parser.add_argument(
+        "--native", action="store_true",
+        help="write raw exl3 tensors (trellis/suh/svh) instead of reconstructing dense F16 weights")
+    parser.add_argument(
         "--outfile", type=Path, default=None,
-        help="path to write to; default: <model>-f16.gguf in the current directory")
+        help="path to write to; default: <model>-f16.gguf (or -exl3.gguf with --native) in the current directory")
     parser.add_argument(
         "--model-name", type=str, default=None,
         help="name of the model (for GGUF metadata)")
@@ -226,7 +320,7 @@ def main() -> None:
     if quant_method != "exl3":
         logger.warning(f"quant_method is {quant_method!r}, expected 'exl3'")
 
-    fname_out = args.outfile or Path(f"./{dir_model.name}-f16.gguf")
+    fname_out = args.outfile or Path(f"./{dir_model.name}-{'exl3' if args.native else 'f16'}.gguf")
 
     with torch.inference_mode():
         model_architecture = get_model_architecture(hparams, ModelType.TEXT)
@@ -238,7 +332,7 @@ def main() -> None:
             sys.exit(1)
 
         exl3_class = type("Exl3" + model_class.__name__, (Exl3Reconstruct, model_class),
-                          {"model_arch": model_class.model_arch})
+                          {"model_arch": model_class.model_arch, "native": args.native})
         if model_class.supports_mtp_export:
             # include MTP layers only if the checkpoint actually has them
             from safetensors import safe_open

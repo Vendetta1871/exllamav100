@@ -38,10 +38,12 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    if (!create_tensor_exl3(exl3_output, *ml, LLM_TENSOR_OUTPUT, -1)) {
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    }
 
     // if output is NULL, init from the input tok embed
-    if (output == NULL) {
+    if (output == NULL && exl3_output.trellis == nullptr) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
 
@@ -51,7 +53,9 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
         create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+        if (!create_tensor_exl3(layer.exl3_wo, *ml, LLM_TENSOR_ATTN_OUT, i)) {
+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+        }
 
         // optional bias tensors
         layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
@@ -67,9 +71,15 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
         }
 
         if (n_expert == 0) {
-            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+            if (!create_tensor_exl3(layer.exl3_ffn_gate, *ml, LLM_TENSOR_FFN_GATE, i)) {
+                layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+            }
+            if (!create_tensor_exl3(layer.exl3_ffn_down, *ml, LLM_TENSOR_FFN_DOWN, i)) {
+                layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+            }
+            if (!create_tensor_exl3(layer.exl3_ffn_up, *ml, LLM_TENSOR_FFN_UP, i)) {
+                layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+            }
 
             // optional MLP bias
             layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
@@ -168,7 +178,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             }
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il,
+                    &model.layers[il].exl3_wo);
             cb(cur, "attn_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -191,7 +202,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
                     NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    LLM_FFN_SILU, LLM_FFN_PAR, il,
+                    &model.layers[il].exl3_ffn_up, &model.layers[il].exl3_ffn_gate, &model.layers[il].exl3_ffn_down);
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
@@ -237,7 +249,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     if constexpr (!embed) {
         // lm_head
-        cur = build_lora_mm(model.output, cur, model.output_s);
+        cur = build_mm_exl3(model.output, &model.exl3_output, cur, model.output_s);
 
         cb(cur, "result_output", -1);
         res->t_logits = cur;

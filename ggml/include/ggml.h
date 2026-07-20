@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_EXL3_MATMUL,
+
         GGML_OP_COUNT,
     };
 
@@ -1435,6 +1437,23 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // EXL3 quantized matmul: y = had128((had128(x (*) suh)) @ W_dec (*) svh) [+ bias]
+    // x:       F32,  ne = [k, rows...]
+    // trellis: I16,  ne = [16*K, n/16, k/16], K = bits per weight (1..8)
+    // suh:     F16,  ne = [k]
+    // svh:     F16,  ne = [n]
+    // bias:    F16,  ne = [n], optional (NULL)
+    // result:  F32,  ne = [n, rows...]
+    GGML_API struct ggml_tensor * ggml_exl3_matmul(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            struct ggml_tensor  * bias,
+            int                   K,
+            int                   codebook);
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(

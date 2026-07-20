@@ -221,6 +221,13 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_norm      = nullptr;
 };
 
+// native EXL3 quantized projection (trellis + input/output scales)
+struct llm_exl3_weight {
+    struct ggml_tensor * trellis = nullptr;
+    struct ggml_tensor * suh     = nullptr;
+    struct ggml_tensor * svh     = nullptr;
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -450,6 +457,18 @@ struct llama_layer {
     struct ggml_tensor * ssm_alpha_in_s     = nullptr;
     struct ggml_tensor * ssm_beta_in_s      = nullptr;
 
+    // exl3
+    llm_exl3_weight exl3_wq;
+    llm_exl3_weight exl3_wk;
+    llm_exl3_weight exl3_wv;
+    llm_exl3_weight exl3_wo;
+    llm_exl3_weight exl3_ffn_gate;
+    llm_exl3_weight exl3_ffn_up;
+    llm_exl3_weight exl3_ffn_down;
+    llm_exl3_weight exl3_wqkv;
+    llm_exl3_weight exl3_wqkv_gate;
+    llm_exl3_weight exl3_ssm_out;
+
     // altup & laurel
     struct ggml_tensor * per_layer_inp_gate   = nullptr;
     struct ggml_tensor * per_layer_proj       = nullptr;
@@ -568,6 +587,9 @@ struct llama_model {
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
+
+    // native EXL3 lm_head
+    llm_exl3_weight exl3_output;
 
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
@@ -722,6 +744,9 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    // helper: load a native EXL3 projection (trellis/suh/svh), returns false if not present
+    bool create_tensor_exl3(llm_exl3_weight & dst, llama_model_loader & ml, llm_tensor tn_, int bid);
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;

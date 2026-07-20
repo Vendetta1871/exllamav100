@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llm_exl3_weight;
 
 struct llama_memory_context_i;
 
@@ -956,6 +957,19 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // mat_mul with a native EXL3 quantized weight
+    ggml_tensor * build_exl3_mm(
+        const llm_exl3_weight & w,
+              ggml_tensor     * cur) const;
+
+    // dispatch to build_exl3_mm if the exl3 weight is present, otherwise build_lora_mm
+    // note: loras are not applied on the exl3 path
+    ggml_tensor * build_mm_exl3(
+              ggml_tensor     * w,
+        const llm_exl3_weight * ex,
+              ggml_tensor     * cur,
+              ggml_tensor     * w_s = nullptr) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
@@ -995,7 +1009,10 @@ struct llm_graph_context {
              ggml_tensor * act_scales,
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
-                     int   il) const;
+                     int   il,
+       const llm_exl3_weight * exl3_up   = nullptr,
+       const llm_exl3_weight * exl3_gate = nullptr,
+       const llm_exl3_weight * exl3_down = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
@@ -1090,7 +1107,8 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+      const llm_exl3_weight * exl3_wo = nullptr) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
@@ -1106,7 +1124,8 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+      const llm_exl3_weight * exl3_wo = nullptr) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
