@@ -10,29 +10,11 @@
 # # with CUDA support
 # GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
-# # with SYCL support
-# GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with VULKAN support
-# GG_BUILD_VULKAN=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with WebGPU support
-# GG_BUILD_WEBGPU=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with MUSA support
-# GG_BUILD_MUSA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with KLEIDIAI support
-# GG_BUILD_KLEIDIAI=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
 # # with BLAS support
 # GG_BUILD_BLAS=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
 # with BLAS support (custom vendor)
 # GG_BUILD_BLAS=1 GG_BUILD_BLAS_VENDOR=Intel10_64lp bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# with OPENVINO support
-# GG_BUILD_OPENVINO=1 GG_BUILD_LOW_PERF=1 GGML_OPENVINO_DEVICE=CPU bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
 
 if [ -z "$2" ]; then
@@ -64,12 +46,6 @@ if [ ! -z "${GG_BUILD_NINJA}" ]; then
     CMAKE_GENERATOR="Ninja"
 fi
 
-if [ ! -z ${GG_BUILD_METAL} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=ON"
-else
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=OFF"
-fi
-
 if [ ! -z ${GG_BUILD_CUDA} ]; then
     # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_CUDA=ON -DGGML_CUDA_CUB_3DOT2=ON"
@@ -88,98 +64,15 @@ if [ ! -z ${GG_BUILD_CUDA} ]; then
     fi
 fi
 
-if [ ! -z ${GG_BUILD_ROCM} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_HIP=ON"
-    if [ -z ${GG_BUILD_AMDGPU_TARGETS} ]; then
-        echo "Missing GG_BUILD_AMDGPU_TARGETS, please set it to your GPU architecture (e.g. gfx90a, gfx1100, etc.)"
-        exit 1
-    fi
-
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGPU_TARGETS=${GG_BUILD_AMDGPU_TARGETS}"
-fi
-
-if [ ! -z ${GG_BUILD_SYCL} ]; then
-    if [ -z ${ONEAPI_ROOT} ]; then
-        echo "Not detected ONEAPI_ROOT, please install oneAPI base toolkit and enable it by:"
-        echo "source /opt/intel/oneapi/setvars.sh"
-        exit 1
-    fi
-    # Use only main GPU
-    export ONEAPI_DEVICE_SELECTOR="level_zero:0"
-    # Enable sysman for correct memory reporting
-    export ZES_ENABLE_SYSMAN=1
-    # to circumvent precision issues on CPY operations
-    export SYCL_PROGRAM_COMPILE_OPTIONS="-cl-fp32-correctly-rounded-divide-sqrt"
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_SYCL=1 -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON"
-fi
-
-if [ ! -z ${GG_BUILD_VULKAN} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_VULKAN=1"
-
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION="/usr/local/lib/cmake/vulkan"
-        MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION="${MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION}/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
-        if [[ -f "${MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION}" || -h "${MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION}" ]]; then
-            CMAKE_EXTRA="${CMAKE_EXTRA} -DSPIRV-Headers_DIR=${MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION}/SPIRV-Headers"
-        fi
-    fi
-
-    # Build shared libs on Windows
-    # to reduce binary size and avoid errors in library loading unit tests
-    if uname -s | grep -qi nt; then
-        CMAKE_EXTRA="${CMAKE_EXTRA} -DBUILD_SHARED_LIBS=ON"
-    fi
-fi
-
-if [ ! -z ${GG_BUILD_WEBGPU} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_WEBGPU=1"
-
-    if [ ! -z "${GG_BUILD_WEBGPU_DAWN_PREFIX}" ]; then
-        if [ -z "${CMAKE_PREFIX_PATH}" ]; then
-            export CMAKE_PREFIX_PATH="${GG_BUILD_WEBGPU_DAWN_PREFIX}"
-        else
-            export CMAKE_PREFIX_PATH="${GG_BUILD_WEBGPU_DAWN_PREFIX}:${CMAKE_PREFIX_PATH}"
-        fi
-    fi
-
-    # For some systems, Dawn_DIR needs to be set explicitly, e.g., the lib64 path
-    if [ ! -z "${GG_BUILD_WEBGPU_DAWN_DIR}" ]; then
-        CMAKE_EXTRA="${CMAKE_EXTRA} -DDawn_DIR=${GG_BUILD_WEBGPU_DAWN_DIR}"
-    fi
-fi
-
-if [ ! -z ${GG_BUILD_MUSA} ]; then
-    # Use qy1 by default (MTT S80)
-    MUSA_ARCH=${MUSA_ARCH:-21}
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_MUSA=ON -DMUSA_ARCHITECTURES=${MUSA_ARCH}"
-fi
-
 if [ ! -z ${GG_BUILD_NO_SVE} ]; then
     # arm 9 and newer enables sve by default, adjust these flags depending on the cpu used
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.5-a+fp16+i8mm"
-fi
-
-if [ -n "${GG_BUILD_KLEIDIAI}" ]; then
-    echo ">>===== Enabling KleidiAI support"
-    CMAKE_EXTRA="${CMAKE_EXTRA:+$CMAKE_EXTRA } -DGGML_CPU_KLEIDIAI=ON"
 fi
 
 if [ ! -z ${GG_BUILD_BLAS} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=${GG_BUILD_BLAS_VENDOR:-OpenBLAS}"
 else
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_BLAS=OFF"
-fi
-
-if [ ! -z ${GG_BUILD_OPENVINO} ]; then
-    if [ -z ${OpenVINO_DIR} ]; then
-        echo "OpenVINO_DIR not found, please install OpenVINO via archives and enable it by:"
-        echo "source /opt/intel/openvino/setupvars.sh"
-        exit 1
-    fi
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_OPENVINO=ON"
-
-    # TODO: fix and re-enable the `test-llama-archs` test below
-    CTEST_EXTRA="-E test-llama-archs"
 fi
 
 ## helpers

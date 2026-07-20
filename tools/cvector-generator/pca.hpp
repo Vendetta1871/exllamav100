@@ -6,10 +6,6 @@
 #include "ggml-cuda.h"
 #endif
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
 #include <cstdio>
 #include <ctime>
 #include <random>
@@ -68,15 +64,6 @@ struct pca_model {
             fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
         }
 #endif
-
-// TODO: enable Metal support when support for GGML_OP_SQRT is added
-// #ifdef GGML_USE_METAL
-//         fprintf(stderr, "%s: using Metal backend\n", __func__);
-//         backend = ggml_backend_metal_init();
-//         if (!backend) {
-//             fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
-//         }
-// #endif
 
         // if there aren't GPU Backends fallback to CPU backend
         if (!backend) {
