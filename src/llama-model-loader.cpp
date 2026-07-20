@@ -1023,6 +1023,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             {
                 op_tensor = ggml_scale(ctx, w, 1.0f);
             } break;
+        case GGML_OP_EXL3_MATMUL:
+            {
+                ggml_tensor * x   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w->ne[2]*16);
+                ggml_tensor * suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, w->ne[2]*16);
+                ggml_tensor * svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, w->ne[1]*16);
+                op_tensor = ggml_exl3_matmul(ctx, x, w, suh, svh, NULL, w->ne[0]/16, 0);
+            } break;
         default:
             GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
     }
@@ -1127,6 +1134,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             } else {
                 op = GGML_OP_ADD;
             }
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "trellis") == 0) {
+            op = GGML_OP_EXL3_MATMUL;
         } else {
             op = info.op;
         }
