@@ -105,6 +105,18 @@ static __global__ void exl3_gemv_kernel(
     const int c0 = lane/4;
     const int r0 = (lane%4)*2;
 
+    // window indices for weight lane*8 + j (invariant across k-rows); the 16-bit window is
+    // ((a:b) >> s) & 0xffff with s in [0,31], i.e. one funnel shift
+    int wi0[8], wi1[8], wsh[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int b2 = (lane*8 + j + 1)*K + 256*K;
+        const int i1 = (b2 - 1)/32;
+        wi0[j] = ((b2 - 16)/32) % (8*K);
+        wi1[j] = i1 % (8*K);
+        wsh[j] = (i1 + 1)*32 - b2;
+    }
+
     for (int64_t row = 0; row < rows; ++row) {
         float acc[8][2] = {};
 
@@ -126,18 +138,16 @@ static __global__ void exl3_gemv_kernel(
             __syncwarp();
 
             const float * xhb = xh_row + krow*16;
-            const float x0 = xhb[r0 + 0];
-            const float x1 = xhb[r0 + 1];
-            const float x2 = xhb[r0 + 8];
-            const float x3 = xhb[r0 + 9];
+            const float2 x01 = *(const float2 *) (xhb + r0);
+            const float2 x23 = *(const float2 *) (xhb + r0 + 8);
 
 #pragma unroll
             for (int t = 0; t < 8; ++t) {
                 const uint32_t * words = sh_w + t*8*K;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const float w = exl3_decode_cb<cb>(exl3_window<K>(words, lane*8 + j));
-                    const float xv = j%4 == 0 ? x0 : j%4 == 1 ? x1 : j%4 == 2 ? x2 : x3;
+                    const float w = exl3_decode_cb<cb>(__funnelshift_rc(words[wi1[j]], words[wi0[j]], wsh[j]) & 0xffff);
+                    const float xv = j%4 == 0 ? x01.x : j%4 == 1 ? x01.y : j%4 == 2 ? x23.x : x23.y;
                     acc[t][j/4] += w*xv;
                 }
             }
@@ -227,6 +237,18 @@ static __global__ void exl3_gemv_splitk_kernel(
     const int c0 = lane/4;
     const int r0 = (lane%4)*2;
 
+    // window indices for weight lane*8 + j (invariant across k-rows); the 16-bit window is
+    // ((a:b) >> s) & 0xffff with s in [0,31], i.e. one funnel shift
+    int wi0[8], wi1[8], wsh[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int b2 = (lane*8 + j + 1)*K + 256*K;
+        const int i1 = (b2 - 1)/32;
+        wi0[j] = ((b2 - 16)/32) % (8*K);
+        wi1[j] = i1 % (8*K);
+        wsh[j] = (i1 + 1)*32 - b2;
+    }
+
     for (int64_t row = 0; row < rows; ++row) {
         float acc[8][2] = {};
 
@@ -274,19 +296,42 @@ static __global__ void exl3_gemv_splitk_kernel(
             __syncwarp();
 
             const float * xhb = xh_row + krow*16;
-            const float x0 = xhb[r0 + 0];
-            const float x1 = xhb[r0 + 1];
-            const float x2 = xhb[r0 + 8];
-            const float x3 = xhb[r0 + 9];
+            const float2 x01 = *(const float2 *) (xhb + r0);
+            const float2 x23 = *(const float2 *) (xhb + r0 + 8);
 
 #pragma unroll
             for (int t = 0; t < 8; ++t) {
                 const uint32_t * words = sh_w + t*8*K;
+                if constexpr (K == 4) {
+                    // i1 = lane for all 8 weights, i0 in {lane-1, lane}: 2 shared loads per tile
+                    const uint32_t wA = words[lane];
+                    const uint32_t wB = words[(lane + 8*K - 1) % (8*K)];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float w = exl3_decode_cb<cb>(exl3_window<K>(words, lane*8 + j));
-                    const float xv = j%4 == 0 ? x0 : j%4 == 1 ? x1 : j%4 == 2 ? x2 : x3;
-                    acc[t][j/4] += w*xv;
+                    for (int j = 0; j < 8; ++j) {
+                        const uint32_t w0 = j < 3 ? wB : wA;
+                        const float w = exl3_decode_cb<cb>(__funnelshift_rc(wA, w0, 28 - 4*j) & 0xffff);
+                        const float xv = j%4 == 0 ? x01.x : j%4 == 1 ? x01.y : j%4 == 2 ? x23.x : x23.y;
+                        acc[t][j/4] += w*xv;
+                    }
+                } else if constexpr (K == 2) {
+                    // i1 = lane/2 for all 8 weights, i0 in {lane/2-1, lane/2}: 2 shared loads per tile
+                    const uint32_t wA = words[lane/2];
+                    const uint32_t wB = words[(lane/2 + 8*K - 1) % (8*K)];
+                    const int sh0 = (lane & 1) ? 14 : 30;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const uint32_t w0 = !(lane & 1) && j < 7 ? wB : wA;
+                        const float w = exl3_decode_cb<cb>(__funnelshift_rc(wA, w0, sh0 - 2*j) & 0xffff);
+                        const float xv = j%4 == 0 ? x01.x : j%4 == 1 ? x01.y : j%4 == 2 ? x23.x : x23.y;
+                        acc[t][j/4] += w*xv;
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const float w = exl3_decode_cb<cb>(__funnelshift_rc(words[wi1[j]], words[wi0[j]], wsh[j]) & 0xffff);
+                        const float xv = j%4 == 0 ? x01.x : j%4 == 1 ? x01.y : j%4 == 2 ? x23.x : x23.y;
+                        acc[t][j/4] += w*xv;
+                    }
                 }
             }
             __syncwarp();
