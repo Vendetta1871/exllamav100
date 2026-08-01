@@ -199,6 +199,178 @@ static __global__ void exl3_gemv_kernel(
     }
 }
 
+// partial sums part[s][row][*] = xh @ W_dec over one slice of the k-tiles (split-k path,
+// the output hadamard is deferred to exl3_epilogue_kernel)
+template <int K, int cb>
+static __global__ void exl3_gemv_splitk_kernel(
+        const uint32_t * __restrict__ trellis, const float * __restrict__ xh,
+        float * __restrict__ part,
+        const int64_t k, const int64_t n, const int64_t rows,
+        const int64_t ne1,
+        const int32_t * __restrict__ ids, const int64_t ids_s1) {
+    extern __shared__ uint32_t sh[];
+    uint32_t * sh_trellis = sh;                          // 8 warps * 64*K words
+    float    * sh_red     = (float *) (sh + 8*64*K);     // 8*128 floats
+
+    const int warp = threadIdx.x/32;
+    const int lane = threadIdx.x%32;
+
+    const int64_t nb    = n/16; // n-tiles per k-row
+    const int64_t krows = k/16;
+    const int64_t kps   = (krows + gridDim.y - 1)/gridDim.y; // k-tiles per split
+    const int64_t k0    = blockIdx.y*kps;
+    const int64_t k1    = min(krows, k0 + kps);
+
+    uint32_t * sh_w = sh_trellis + warp*64*K;
+
+    // tile position of packed weight i = lane*8 + j: r = r0 + {0,1,8,9}[j%4], c = c0 + (j >= 4 ? 8 : 0)
+    const int c0 = lane/4;
+    const int r0 = (lane%4)*2;
+
+    for (int64_t row = 0; row < rows; ++row) {
+        float acc[8][2] = {};
+
+        const float * xh_row = xh + row*k;
+
+        int64_t e = 0;
+        if (ids) {
+            e = ids[row%ne1 + (row/ne1)*ids_s1];
+        }
+        const uint32_t * trellis_e = trellis + e*krows*nb*(8*K);
+
+        // prefetch pipeline: pf holds the next k-row's packed words (LDGs issued while decoding)
+        constexpr int PF = (16*K + 31)/32; // uint4 per lane per k-row
+        uint4 pf[PF];
+
+        for (int64_t krow = k0 + warp; krow < k1; krow += 8) {
+            uint4 * dst4 = (uint4 *) sh_w;
+            const uint4 * src = (const uint4 *) (trellis_e + (krow*nb + blockIdx.x*8)*(8*K));
+            if (krow == k0 + warp) {
+#pragma unroll
+                for (int i = 0; i < PF; ++i) {
+                    const int idx = lane + i*32;
+                    if (idx < 16*K) {
+                        pf[i] = __ldcs(src + idx);
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < PF; ++i) {
+                const int idx = lane + i*32;
+                if (idx < 16*K) {
+                    dst4[idx] = pf[i];
+                }
+            }
+            if (krow + 8 < k1) {
+                const uint4 * src1 = src + 8*nb*(8*K)/4;
+#pragma unroll
+                for (int i = 0; i < PF; ++i) {
+                    const int idx = lane + i*32;
+                    if (idx < 16*K) {
+                        pf[i] = __ldcs(src1 + idx);
+                    }
+                }
+            }
+            __syncwarp();
+
+            const float * xhb = xh_row + krow*16;
+            const float x0 = xhb[r0 + 0];
+            const float x1 = xhb[r0 + 1];
+            const float x2 = xhb[r0 + 8];
+            const float x3 = xhb[r0 + 9];
+
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const uint32_t * words = sh_w + t*8*K;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float w = exl3_decode_cb<cb>(exl3_window<K>(words, lane*8 + j));
+                    const float xv = j%4 == 0 ? x0 : j%4 == 1 ? x1 : j%4 == 2 ? x2 : x3;
+                    acc[t][j/4] += w*xv;
+                }
+            }
+            __syncwarp();
+        }
+
+        // reduce across the 4 lanes of each quad
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            acc[t][0] += __shfl_xor_sync(0xffffffffu, acc[t][0], 1);
+            acc[t][0] += __shfl_xor_sync(0xffffffffu, acc[t][0], 2);
+            acc[t][1] += __shfl_xor_sync(0xffffffffu, acc[t][1], 1);
+            acc[t][1] += __shfl_xor_sync(0xffffffffu, acc[t][1], 2);
+        }
+        if (lane%4 == 0) {
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                sh_red[warp*128 + t*16 + c0]     = acc[t][0];
+                sh_red[warp*128 + t*16 + c0 + 8] = acc[t][1];
+            }
+        }
+        __syncthreads();
+
+        const int col = threadIdx.x;
+        if (col < 128) {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                v += sh_red[w*128 + col];
+            }
+            part[(blockIdx.y*rows + row)*n + blockIdx.x*128 + col] = v;
+        }
+        __syncthreads(); // protect sh_red reuse on the next row
+    }
+}
+
+// split-k epilogue: y = had128(sum_s part[s]) (*) svh [+ bias], one block per 128 output columns
+static __global__ void exl3_epilogue_kernel(
+        const float * __restrict__ part,
+        const half * __restrict__ svh, const half * __restrict__ bias, float * __restrict__ dst,
+        const int64_t n, const int64_t rows, const int S,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int64_t ne1, const int64_t ne2,
+        const int32_t * __restrict__ ids, const int64_t ids_s1) {
+    __shared__ float sh_had[128];
+
+    const int tid = threadIdx.x;
+    const int64_t row = blockIdx.y;
+
+    const int64_t out_col = blockIdx.x*128 + tid;
+
+    float v = 0.0f;
+    for (int s = 0; s < S; ++s) {
+        v += part[(s*rows + row)*n + out_col];
+    }
+    sh_had[tid] = v;
+    __syncthreads();
+
+    // output hadamard
+    for (int h = 1; h < 128; h *= 2) {
+        if ((tid & h) == 0) {
+            const float a = sh_had[tid];
+            const float b = sh_had[tid + h];
+            sh_had[tid]     = a + b;
+            sh_had[tid + h] = a - b;
+        }
+        __syncthreads();
+    }
+
+    int64_t e = 0;
+    if (ids) {
+        e = ids[row%ne1 + (row/ne1)*ids_s1];
+    }
+    v = sh_had[tid]*EXL3_HAD128_SCALE*__half2float(svh[e*n + out_col]);
+    if (bias) {
+        v += __half2float(bias[out_col]);
+    }
+
+    const int64_t r1 = row % ne1;
+    const int64_t r2 = (row/ne1) % ne2;
+    const int64_t r3 = row/(ne1*ne2);
+    float * dr = (float *) ((char *) dst + r1*nb1 + r2*nb2 + r3*nb3);
+    dr[out_col] = v;
+}
+
 // y = had128(xh @ W_dec) (*) svh [+ bias] for M_TILE rows per block, Volta tensor cores
 // block: M_TILE rows x 128 output columns (8 n-tiles); warp w handles n-tile w
 template <int K, int cb, int M_TILE>
@@ -333,6 +505,31 @@ static const exl3_gemv_kernel_t exl3_gemm_kernels[9][3] = {
     EXL3_GEMM_ROW(5), EXL3_GEMM_ROW(6), EXL3_GEMM_ROW(7), EXL3_GEMM_ROW(8),
 };
 
+typedef void (* exl3_gemv_splitk_kernel_t)(
+        const uint32_t *, const float *, float *,
+        int64_t, int64_t, int64_t, int64_t,
+        const int32_t *, int64_t);
+
+#define EXL3_SPLITK_ROW(K) { exl3_gemv_splitk_kernel<K, 0>, exl3_gemv_splitk_kernel<K, 1>, exl3_gemv_splitk_kernel<K, 2> }
+
+static const exl3_gemv_splitk_kernel_t exl3_gemv_splitk_kernels[9][3] = {
+    { nullptr, nullptr, nullptr },
+    EXL3_SPLITK_ROW(1), EXL3_SPLITK_ROW(2), EXL3_SPLITK_ROW(3), EXL3_SPLITK_ROW(4),
+    EXL3_SPLITK_ROW(5), EXL3_SPLITK_ROW(6), EXL3_SPLITK_ROW(7), EXL3_SPLITK_ROW(8),
+};
+
+// split factor for the split-k gemv path: aim for ~240 blocks, at least 8 k-tiles per split
+static int exl3_gemv_splits(const int64_t n, const int64_t k, const int64_t rows) {
+    if (rows > 8) {
+        return 1;
+    }
+    const int64_t nb128 = n/128;
+    const int64_t krows = k/16;
+    int S = (int) MIN((240 + nb128 - 1)/nb128, krows/8);
+    S = MIN(S, 32);
+    return MAX(S, 1);
+}
+
 void ggml_cuda_op_exl3_matmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0]; // x, F32 [k, rows...]
     const ggml_tensor * src1 = dst->src[1]; // trellis, I16 [16*K, n/16, k/16]
@@ -374,6 +571,21 @@ void ggml_cuda_op_exl3_matmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    const int S = exl3_gemv_splits(n, k, rows);
+    if (S > 1) {
+        ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) S*rows*n);
+        const int shmem = 8*64*K*sizeof(uint32_t) + 8*128*sizeof(float);
+        exl3_gemv_splitk_kernels[K][cb]<<<dim3(n/128, S), 256, shmem, stream>>>(
+            (const uint32_t *) src1->data, xh.get(), part.get(),
+            k, n, rows, dst->ne[1], nullptr, 0);
+        exl3_epilogue_kernel<<<dim3(n/128, rows), 128, 0, stream>>>(
+            part.get(), (const half *) src3->data, src4 ? (const half *) src4->data : nullptr,
+            (float *) dst->data, n, rows, S,
+            dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2],
+            nullptr, 0);
+        return;
+    }
+
     const int shmem = 8*64*K*sizeof(uint32_t) + (8*128 + 128)*sizeof(float);
     exl3_gemv_kernels[K][cb]<<<dim3(n/128), 256, shmem, stream>>>(
         (const uint32_t *) src1->data, xh.get(), (const half *) src3->data,
@@ -408,12 +620,26 @@ void ggml_cuda_op_exl3_matmul_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     ggml_cuda_pool_alloc<float> xh(ctx.pool(), (size_t) rows*k);
 
-    // v1: gemv-style path only (rows looped inside); a wmma GEMM-ID path for large
-    // prefill batches is future work
     exl3_had_in_kernel<<<dim3(k/128, rows), 128, 0, stream>>>(
         (const float *) src0->data, (const half *) src3->data, xh.get(), k,
         src0->nb[1], src0->nb[2], src0->nb[3], src2->ne[0], src2->ne[1],
         (const int32_t *) src2->data, src2->nb[1]/sizeof(int32_t), src0->ne[1]);
+
+    const int S = exl3_gemv_splits(n, k, rows);
+    if (S > 1) {
+        ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) S*rows*n);
+        const int shmem = 8*64*K*sizeof(uint32_t) + 8*128*sizeof(float);
+        exl3_gemv_splitk_kernels[K][cb]<<<dim3(n/128, S), 256, shmem, stream>>>(
+            (const uint32_t *) src1->data, xh.get(), part.get(),
+            k, n, rows, dst->ne[1],
+            (const int32_t *) src2->data, src2->nb[1]/sizeof(int32_t));
+        exl3_epilogue_kernel<<<dim3(n/128, rows), 128, 0, stream>>>(
+            part.get(), (const half *) src4->data, nullptr,
+            (float *) dst->data, n, rows, S,
+            dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2],
+            (const int32_t *) src2->data, src2->nb[1]/sizeof(int32_t));
+        return;
+    }
 
     const int shmem = 8*64*K*sizeof(uint32_t) + (8*128 + 128)*sizeof(float);
     exl3_gemv_kernels[K][cb]<<<dim3(n/128), 256, shmem, stream>>>(
