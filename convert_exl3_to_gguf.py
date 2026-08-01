@@ -229,6 +229,9 @@ class Exl3Reconstruct:
         groups: dict[str, dict[str, torch.Tensor]] = {}
         passthrough: list[tuple[str, object]] = []
         for name, gen in self.model_tensors.items():
+            if name.startswith("model.visual."):
+                # vision tower is not supported by the text model
+                continue
             base, dot, sub = name.rpartition(".")
             if dot and sub in self.EXL3_SUBTENSORS:
                 groups.setdefault(base, {})[sub] = gen
