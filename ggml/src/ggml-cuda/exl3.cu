@@ -482,6 +482,173 @@ static __global__ void exl3_gemm_kernel(
     }
 }
 
+// expert -> row-list mapping for the GEMM-ID path (single block): counting sort of the
+// (u,t) rows by expert id, plus a work list of (expert, row-block start) pairs
+static __global__ void exl3_id_map_kernel(
+        const int32_t * __restrict__ ids, const int64_t ids_s1,
+        const int neu, const int64_t rows, const int n_expert,
+        int32_t * __restrict__ wcount, int32_t * __restrict__ offs,
+        int32_t * __restrict__ sorted, int2 * __restrict__ work) {
+    extern __shared__ int32_t sm[]; // counts/cursor[n_expert], woff[n_expert+1]
+    int32_t * cnt  = sm;
+    int32_t * woff = sm + n_expert;
+
+    const int tid = threadIdx.x;
+
+    for (int e = tid; e < n_expert; e += blockDim.x) {
+        cnt[e] = 0;
+    }
+    __syncthreads();
+
+    for (int64_t r = tid; r < rows; r += blockDim.x) {
+        const int e = ids[(int)(r%neu) + (int)(r/neu)*ids_s1];
+        atomicAdd(&cnt[e], 1);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int acc = 0, wacc = 0;
+        for (int e = 0; e < n_expert; ++e) {
+            const int c = cnt[e];
+            offs[e] = acc;
+            cnt[e]  = acc; // reuse as scatter cursor
+            woff[e] = wacc;
+            acc  += c;
+            wacc += (c + 15)/16;
+        }
+        offs[n_expert] = acc;
+        woff[n_expert] = wacc;
+        wcount[0] = wacc;
+    }
+    __syncthreads();
+
+    for (int64_t r = tid; r < rows; r += blockDim.x) {
+        const int e = ids[(int)(r%neu) + (int)(r/neu)*ids_s1];
+        sorted[atomicAdd(&cnt[e], 1)] = (int32_t) r;
+    }
+    __syncthreads();
+
+    for (int e = tid; e < n_expert; e += blockDim.x) {
+        const int nb_e = (offs[e+1] - offs[e] + 15)/16;
+        for (int b = 0; b < nb_e; ++b) {
+            work[woff[e] + b] = make_int2(e, offs[e] + b*16);
+        }
+    }
+}
+
+// y = had128(xh @ W_dec[e]) (*) svh[e] for 16 gathered rows per block, Volta tensor cores
+// grid: (n/128, work items); block gathers its 16 rows of expert e via the sorted row list
+template <int K, int cb>
+static __global__ void exl3_gemm_id_kernel(
+        const uint32_t * __restrict__ trellis, const float * __restrict__ xh,
+        const half * __restrict__ svh, float * __restrict__ dst,
+        const int32_t * __restrict__ wcount, const int32_t * __restrict__ offs,
+        const int32_t * __restrict__ sorted, const int2 * __restrict__ work,
+        const int64_t k, const int64_t n,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const int64_t ne1, const int64_t ne2) {
+    if ((int) blockIdx.y >= wcount[0]) {
+        return;
+    }
+
+    extern __shared__ __align__(32) unsigned char shm[];
+    half     * a_sh   = (half *) shm;                  // 16*16 halfs, row-major
+    half     * b_sh   = a_sh + 16*16;                  // 8*256 halfs, per-warp col-major tile
+    uint32_t * pack   = (uint32_t *) (b_sh + 8*256);   // 8*8*K words, per-warp packed tile
+    float    * y_sh   = (float *) (pack + 8*8*K);      // 16*128 floats, row-major
+    int32_t  * rows_sh = (int32_t *) (y_sh + 16*128);  // 16 row ids
+
+    const int warp = threadIdx.x/32;
+    const int lane = threadIdx.x%32;
+    const int tid  = threadIdx.x;
+
+    const int64_t nb    = n/16; // n-tiles per k-row
+    const int64_t krows = k/16;
+
+    const int2  wi    = work[blockIdx.y];
+    const int   e     = wi.x;
+    const int   start = wi.y;
+    const int   end   = min(start + 16, offs[e+1]);
+
+    const uint32_t * trellis_e = trellis + (int64_t) e*krows*nb*(8*K);
+    const half     * svh_e     = svh + (int64_t) e*n;
+
+    if (tid < 16) {
+        rows_sh[tid] = start + tid < end ? sorted[start + tid] : -1;
+    }
+    __syncthreads();
+
+    uint32_t * pack_w = pack + warp*8*K;
+    half     * b_w    = b_sh + warp*256;
+
+    // tile position of packed weight i = lane*8 + j: r = r0 + {0,1,8,9}[j%4], c = c0 + (j >= 4 ? 8 : 0)
+    const int c0 = lane/4;
+    const int r0 = (lane%4)*2;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+
+    for (int64_t kt = 0; kt < krows; ++kt) {
+        // gather the A tile (16 x 16) from the F32 xh workspace as fp16, zero-pad empty rows
+#pragma unroll
+        for (int idx = tid; idx < 16*16; idx += 256) {
+            const int rr = rows_sh[idx/16];
+            a_sh[idx] = rr >= 0 ? __float2half(xh[(int64_t) rr*k + kt*16 + idx%16]) : __float2half(0.0f);
+        }
+
+        // stage and decode this warp's 16x16 B tile
+        const uint32_t * src = trellis_e + (kt*nb + blockIdx.x*8 + warp)*(8*K);
+#pragma unroll
+        for (int i = lane; i < 8*K; i += 32) {
+            pack_w[i] = __ldcs(src + i);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float w = exl3_decode_cb<cb>(exl3_window<K>(pack_w, lane*8 + j));
+            b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+        wmma::load_matrix_sync(a_frag, a_sh, 16);
+        wmma::load_matrix_sync(b_frag, b_w, 16);
+        wmma::mma_sync(acc, a_frag, b_frag, acc);
+        __syncthreads();
+    }
+
+    // store the C fragment to the shared y tile (16 x 128)
+    wmma::store_matrix_sync(y_sh + warp*16, acc, 128, wmma::mem_row_major);
+    __syncthreads();
+
+    // output hadamard + svh per row, scatter back by row id; warp w handles rows w, w+8, ...
+    for (int r = warp; r < end - start; r += 8) {
+        float * yr = y_sh + r*128;
+        for (int h = 1; h < 128; h *= 2) {
+            for (int p = lane; p < 64; p += 32) {
+                const int i = (p/h)*2*h + p%h;
+                const float a = yr[i];
+                const float b = yr[i + h];
+                yr[i]     = a + b;
+                yr[i + h] = a - b;
+            }
+            __syncwarp();
+        }
+
+        const int64_t row = rows_sh[r];
+        const int64_t r1 = row % ne1;
+        const int64_t r2 = (row/ne1) % ne2;
+        const int64_t r3 = row/(ne1*ne2);
+        float * dr = (float *) ((char *) dst + r1*nb1 + r2*nb2 + r3*nb3) + blockIdx.x*128;
+        for (int col = lane; col < 128; col += 32) {
+            const int64_t out_col = blockIdx.x*128 + col;
+            dr[col] = yr[col]*EXL3_HAD128_SCALE*__half2float(svh_e[out_col]);
+        }
+        __syncwarp();
+    }
+}
+
 typedef void (* exl3_gemv_kernel_t)(
         const uint32_t *, const float *, const half *, const half *, float *,
         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
@@ -516,6 +683,19 @@ static const exl3_gemv_splitk_kernel_t exl3_gemv_splitk_kernels[9][3] = {
     { nullptr, nullptr, nullptr },
     EXL3_SPLITK_ROW(1), EXL3_SPLITK_ROW(2), EXL3_SPLITK_ROW(3), EXL3_SPLITK_ROW(4),
     EXL3_SPLITK_ROW(5), EXL3_SPLITK_ROW(6), EXL3_SPLITK_ROW(7), EXL3_SPLITK_ROW(8),
+};
+
+typedef void (* exl3_gemm_id_kernel_t)(
+        const uint32_t *, const float *, const half *, float *,
+        const int32_t *, const int32_t *, const int32_t *, const int2 *,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+
+#define EXL3_GEMM_ID_ROW(K) { exl3_gemm_id_kernel<K, 0>, exl3_gemm_id_kernel<K, 1>, exl3_gemm_id_kernel<K, 2> }
+
+static const exl3_gemm_id_kernel_t exl3_gemm_id_kernels[9][3] = {
+    { nullptr, nullptr, nullptr },
+    EXL3_GEMM_ID_ROW(1), EXL3_GEMM_ID_ROW(2), EXL3_GEMM_ID_ROW(3), EXL3_GEMM_ID_ROW(4),
+    EXL3_GEMM_ID_ROW(5), EXL3_GEMM_ID_ROW(6), EXL3_GEMM_ID_ROW(7), EXL3_GEMM_ID_ROW(8),
 };
 
 // split factor for the split-k gemv path: aim for ~240 blocks, at least 8 k-tiles per split
@@ -624,6 +804,34 @@ void ggml_cuda_op_exl3_matmul_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         (const float *) src0->data, (const half *) src3->data, xh.get(), k,
         src0->nb[1], src0->nb[2], src0->nb[3], src2->ne[0], src2->ne[1],
         (const int32_t *) src2->data, src2->nb[1]/sizeof(int32_t), src0->ne[1]);
+
+    // rows > 8: group rows by expert and use the wmma GEMM path; rows <= 8 stay on
+    // the gemv/split-k path (decode hot path)
+    if (rows > 8) {
+        const int64_t n_expert = src1->ne[3];
+        const int64_t w_max    = n_expert + (rows + 15)/16;
+
+        // workspace: work[2*w_max] | wcount[1] | offs[n_expert+1] | sorted[rows]
+        ggml_cuda_pool_alloc<int32_t> ws(ctx.pool(), (size_t) 2*w_max + 1 + (n_expert + 1) + rows);
+        int2     * work   = (int2 *) ws.get();
+        int32_t  * wcount = ws.get() + 2*w_max;
+        int32_t  * offs   = wcount + 1;
+        int32_t  * sorted = offs + n_expert + 1;
+
+        const int map_smem = (2*n_expert + 1)*sizeof(int32_t);
+        exl3_id_map_kernel<<<1, 256, map_smem, stream>>>(
+            (const int32_t *) src2->data, src2->nb[1]/sizeof(int32_t),
+            (int) src2->ne[0], rows, (int) n_expert, wcount, offs, sorted, work);
+
+        const int shmem = 16*16*sizeof(half) + 8*256*sizeof(half) + 8*8*K*sizeof(uint32_t)
+                        + 16*128*sizeof(float) + 16*sizeof(int32_t);
+        exl3_gemm_id_kernels[K][cb]<<<dim3(n/128, w_max), 256, shmem, stream>>>(
+            (const uint32_t *) src1->data, xh.get(), (const half *) src4->data, (float *) dst->data,
+            wcount, offs, sorted, work,
+            k, n,
+            dst->nb[1], dst->nb[2], dst->nb[3], dst->ne[1], dst->ne[2]);
+        return;
+    }
 
     const int S = exl3_gemv_splits(n, k, rows);
     if (S > 1) {
