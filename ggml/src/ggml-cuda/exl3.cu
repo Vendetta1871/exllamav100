@@ -325,6 +325,24 @@ static __global__ void exl3_gemv_splitk_kernel(
                         const float xv = j%4 == 0 ? x01.x : j%4 == 1 ? x01.y : j%4 == 2 ? x23.x : x23.y;
                         acc[t][j/4] += w*xv;
                     }
+                } else if constexpr (K == 3) {
+                    // lane's windows span words q-1..q+1, q = lane*3/4: 3 shared loads per tile
+                    const int      q  = lane*3/4;
+                    const uint32_t wC = words[q];
+                    const uint32_t wP = words[(q + 8*K - 1) % (8*K)];
+                    const uint32_t wN = words[(q + 1) % (8*K)];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int b2 = lane*24 + 3*(j + 1);
+                        const int i1 = (b2 - 1) >> 5;
+                        const int i0 = (b2 - 16) >> 5;
+                        const uint32_t w1 = i1 > q ? wN : wC;
+                        const int      rq = i0 - q;
+                        const uint32_t w0 = rq < 0 ? wP : rq > 0 ? wN : wC;
+                        const float w = exl3_decode_cb<cb>(__funnelshift_rc(w1, w0, ((i1 + 1) << 5) - b2) & 0xffff);
+                        const float xv = j%4 == 0 ? x01.x : j%4 == 1 ? x01.y : j%4 == 2 ? x23.x : x23.y;
+                        acc[t][j/4] += w*xv;
+                    }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
@@ -449,6 +467,19 @@ static __global__ void exl3_gemm_kernel(
     const int c0 = lane/4;
     const int r0 = (lane%4)*2;
 
+    // window indices for weight lane*8 + j (generic K; K = 2/3/4 use the register-pair path below)
+    int wi0[8], wi1[8], wsh[8];
+    if constexpr (K != 2 && K != 3 && K != 4) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int b2 = (lane*8 + j + 1)*K + 256*K;
+            const int i1 = (b2 - 1)/32;
+            wi0[j] = ((b2 - 16)/32) % (8*K);
+            wi1[j] = i1 % (8*K);
+            wsh[j] = (i1 + 1)*32 - b2;
+        }
+    }
+
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[M_TILE/16];
 #pragma unroll
     for (int mf = 0; mf < M_TILE/16; ++mf) {
@@ -470,10 +501,48 @@ static __global__ void exl3_gemm_kernel(
             pack_w[i] = __ldcs(src + i);
         }
         __syncwarp();
+        if constexpr (K == 4 || K == 2) {
+            // i1 = lane (K = 4) or lane/2 (K = 2) for all 8 weights: 2 shared loads per tile
+            const int      i1 = K == 4 ? lane : lane/2;
+            const uint32_t wA = pack_w[i1];
+            const uint32_t wB = pack_w[(i1 + 8*K - 1) % (8*K)];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const float w = exl3_decode_cb<cb>(exl3_window<K>(pack_w, lane*8 + j));
-            b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+            for (int j = 0; j < 8; ++j) {
+                uint32_t w0;
+                int sh;
+                if constexpr (K == 4) {
+                    w0 = j < 3 ? wB : wA;
+                    sh = 28 - 4*j;
+                } else {
+                    w0 = !(lane & 1) && j < 7 ? wB : wA;
+                    sh = ((lane & 1) ? 14 : 30) - 2*j;
+                }
+                const float w = exl3_decode_cb<cb>(__funnelshift_rc(wA, w0, sh) & 0xffff);
+                b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+            }
+        } else if constexpr (K == 3) {
+            // lane's windows span words q-1..q+1, q = lane*3/4: 3 shared loads per tile
+            const int      q  = lane*3/4;
+            const uint32_t wC = pack_w[q];
+            const uint32_t wP = pack_w[(q + 8*K - 1) % (8*K)];
+            const uint32_t wN = pack_w[(q + 1) % (8*K)];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int b2 = lane*24 + 3*(j + 1);
+                const int i1 = (b2 - 1) >> 5;
+                const int i0 = (b2 - 16) >> 5;
+                const uint32_t w1 = i1 > q ? wN : wC;
+                const int      rq = i0 - q;
+                const uint32_t w0 = rq < 0 ? wP : rq > 0 ? wN : wC;
+                const float w = exl3_decode_cb<cb>(__funnelshift_rc(w1, w0, ((i1 + 1) << 5) - b2) & 0xffff);
+                b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float w = exl3_decode_cb<cb>(__funnelshift_rc(pack_w[wi1[j]], pack_w[wi0[j]], wsh[j]) & 0xffff);
+                b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+            }
         }
         __syncthreads();
 
@@ -648,10 +717,31 @@ static __global__ void exl3_gemm_id_kernel(
             pack_w[i] = __ldcs(src + i);
         }
         __syncwarp();
+        if constexpr (K == 4 || K == 2) {
+            // i1 = lane (K = 4) or lane/2 (K = 2) for all 8 weights: 2 shared loads per tile
+            const int      i1 = K == 4 ? lane : lane/2;
+            const uint32_t wA = pack_w[i1];
+            const uint32_t wB = pack_w[(i1 + 8*K - 1) % (8*K)];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const float w = exl3_decode_cb<cb>(exl3_window<K>(pack_w, lane*8 + j));
-            b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+            for (int j = 0; j < 8; ++j) {
+                uint32_t w0;
+                int sh;
+                if constexpr (K == 4) {
+                    w0 = j < 3 ? wB : wA;
+                    sh = 28 - 4*j;
+                } else {
+                    w0 = !(lane & 1) && j < 7 ? wB : wA;
+                    sh = ((lane & 1) ? 14 : 30) - 2*j;
+                }
+                const float w = exl3_decode_cb<cb>(__funnelshift_rc(wA, w0, sh) & 0xffff);
+                b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float w = exl3_decode_cb<cb>(exl3_window<K>(pack_w, lane*8 + j));
+                b_w[(c0 + (j >= 4 ? 8 : 0))*16 + r0 + (j%4 == 0 ? 0 : j%4 == 1 ? 1 : j%4 == 2 ? 8 : 9)] = __float2half(w);
+            }
         }
         __syncthreads();
 
@@ -707,7 +797,7 @@ static const exl3_gemv_kernel_t exl3_gemv_kernels[9][3] = {
     EXL3_GEMV_ROW(5), EXL3_GEMV_ROW(6), EXL3_GEMV_ROW(7), EXL3_GEMV_ROW(8),
 };
 
-#define EXL3_M_TILE 16
+#define EXL3_M_TILE 64
 
 #define EXL3_GEMM_ROW(K) { exl3_gemm_kernel<K, 0, EXL3_M_TILE>, exl3_gemm_kernel<K, 1, EXL3_M_TILE>, exl3_gemm_kernel<K, 2, EXL3_M_TILE> }
 
