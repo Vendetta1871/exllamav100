@@ -229,8 +229,8 @@ class Exl3Reconstruct:
         groups: dict[str, dict[str, torch.Tensor]] = {}
         passthrough: list[tuple[str, object]] = []
         for name, gen in self.model_tensors.items():
-            if name.startswith("model.visual."):
-                # vision tower is not supported by the text model
+            if name.startswith("model.visual.") or name.startswith("mtp."):
+                # vision tower and MTP head are not supported by the text model
                 continue
             base, dot, sub = name.rpartition(".")
             if dot and sub in self.EXL3_SUBTENSORS:
@@ -394,16 +394,8 @@ def main() -> None:
         exl3_class = type("Exl3" + model_class.__name__, (Exl3Reconstruct, model_class),
                           {"model_arch": model_class.model_arch, "native": args.native})
         if model_class.supports_mtp_export:
-            # include MTP layers only if the checkpoint actually has them
-            from safetensors import safe_open
-            has_mtp = False
-            for st in dir_model.glob("*.safetensors"):
-                with safe_open(str(st), framework="numpy") as f:
-                    if any(n.startswith(("mtp.", "model.mtp.")) for n in f.keys()):
-                        has_mtp = True
-                        break
-            if not has_mtp:
-                exl3_class.no_mtp = True
+            # MTP (speculative decoding head) is not supported, drop it
+            exl3_class.no_mtp = True
         model_instance = exl3_class(
             dir_model, gguf.LlamaFileType.MOSTLY_F16, fname_out,
             eager=True, model_name=args.model_name,
