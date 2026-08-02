@@ -28,8 +28,9 @@ EXL3 weights natively in GGUF and executes them with Volta-compatible kernels
 
 | Model                              | pp512 t/s | tg128 t/s |
 | ---------------------------------- | --------: | --------: |
-| Qwen3.5-4B-exl3-4.00bpw            |     1150  |     97.6  |
-| gemma-4-26B-A4B-it-exl3 (MoE, K=2) |      985  |     73.0  |
+| Qwen3.5-4B-exl3-4.00bpw            |     2205  |    100.5  |
+| gemma-4-26B-A4B-it-exl3 (MoE, K=2) |     1209  |     72.1  |
+| Qwen3.6-27B-exl3 (K=3/4/5 mix)     |      399  |     25.4  |
 
 ## Usage
 
