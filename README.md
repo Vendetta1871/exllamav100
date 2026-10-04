@@ -40,10 +40,23 @@ Convert an EXL3 safetensors checkpoint to native GGUF:
 python convert_exl3_to_gguf.py /path/to/exl3-model --native --outfile model-exl3.gguf
 ```
 
-Build and run (a CUDA toolkit that still supports sm_70 is required):
+Build and run (a CUDA toolkit that still supports sm_70 is required). The ggml
+library with the EXL3 backend lives in a separate repository,
+[ggml-exl3](https://github.com/Vendetta1871/ggml-exl3) - build and install it
+first, then point this project at the install prefix:
 
 ```sh
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release
+# ggml-exl3 (once, reinstall after each update)
+cmake -S /path/to/ggml-exl3 -B /path/to/ggml-exl3/build \
+    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF \
+    -DCMAKE_INSTALL_PREFIX=/path/to/ggml-exl3/install
+cmake --build /path/to/ggml-exl3/build -j
+cmake --install /path/to/ggml-exl3/build
+
+# this project
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH=/path/to/ggml-exl3/install
 cmake --build build -j
 build/bin/llama-cli -m model-exl3.gguf -ngl 99 -p "The capital of France is" -n 64
 ```

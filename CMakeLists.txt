@@ -31,7 +31,7 @@ else()
     set(LLAMA_STANDALONE OFF)
 endif()
 
-option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
+option(LLAMA_USE_SYSTEM_GGML "Use system libggml" ON)
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
